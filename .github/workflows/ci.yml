@@ -23,7 +23,7 @@ jobs:
     name: Format, lint and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -51,7 +51,7 @@ jobs:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The floor declared in `Cargo.toml`, which is `soroban-sdk` 27's own floor.
       # Declaring an MSRV and never building at it is how it silently drifts upward.
@@ -71,7 +71,7 @@ jobs:
     name: Verify the vendored contract
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # `tests/third_party.rs` claims the contract under `third-party/` is upstream's,
       # unmodified. That claim is only worth anything if it is checked. This
@@ -84,7 +84,7 @@ jobs:
     name: Benchmark the harness
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -116,7 +116,7 @@ jobs:
 
       - name: Upload the benchmark output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: soroban-fuzzer-bench
           path: bench.txt
@@ -126,7 +126,7 @@ jobs:
     name: Fuzz the example and publish the report
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -189,7 +189,7 @@ jobs:
 
       - name: Upload the failure report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: soroban-fuzzer-report
           path: fuzz-report.json
