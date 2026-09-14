@@ -85,9 +85,10 @@
 //! ```
 //!
 //! A complete, runnable version — a token with a conservation-of-supply invariant and
-//! an authorization invariant — lives in `examples/token.rs`. The `tests/`
-//! directory covers both a passing target and deliberately buggy targets that the
-//! harness must catch and shrink.
+//! an authorization invariant — lives in `examples/token_fuzz.rs`. The `tests/`
+//! directory covers a passing target, deliberately buggy targets the harness must catch
+//! and shrink, and an unmodified third-party contract from `stellar/soroban-examples`
+//! under `tests/third_party.rs`.
 //!
 //! # How a case runs
 //!
@@ -142,6 +143,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
+pub mod arbitrary_bridge;
 pub mod budget;
 pub mod config;
 pub mod invariant;
@@ -152,6 +154,7 @@ pub mod runtime;
 pub mod storage;
 pub mod target;
 
+pub use arbitrary_bridge::{from_arbitrary, from_arbitrary_with};
 pub use budget::{
     mainnet_limits, InvocationResourceLimits, InvocationResources, LimitBreach, ResourceUsage,
 };
@@ -159,7 +162,9 @@ pub use config::{AuthPolicy, FuzzConfig, ResourcePolicy};
 pub use invariant::{
     CheckCtx, FnInvariant, Invariant, StorageGrowthBounded, SupplyConserved, SupplyReader,
 };
-pub use report::{CallRecord, FailureReport, FuzzOutcome, Journal, ReportConfig, StepRecord};
+pub use report::{
+    ActionStats, CallRecord, FailureReport, FuzzOutcome, Journal, ReportConfig, StepRecord,
+};
 pub use runner::{check, run};
 pub use runtime::{CallResult, LedgerCtl, Runtime, StepOutcome};
 pub use storage::{

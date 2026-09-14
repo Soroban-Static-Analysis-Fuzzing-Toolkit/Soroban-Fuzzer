@@ -78,6 +78,23 @@ pub struct FuzzConfig {
     pub report_path: Option<PathBuf>,
     /// proptest verbosity: `0` silent, `1` logs each case, `2` logs each action.
     pub verbose: u32,
+    /// Warn when at least this fraction of generated actions was rejected by the
+    /// contract without the target expecting it. Defaults to `Some(0.5)`; `None`
+    /// disables the warning.
+    ///
+    /// A run that warns has still passed. See
+    /// [`FuzzOutcome::Passed`](crate::FuzzOutcome::Passed) for why that is worth
+    /// knowing about.
+    pub rejection_warning_ratio: Option<f64>,
+    /// Run only this case of the seeded sequence, instead of all of them. `None`
+    /// (the default) runs every case.
+    ///
+    /// Reproducing one case by re-running a whole run is a lot of noise when a target
+    /// takes minutes per run, and a failing case's report already names the one worth
+    /// looking at. Replaying is only meaningful against a pinned [`FuzzConfig::seed`],
+    /// because the index names a position in the generated stream; without a seed the
+    /// run aborts with a message saying so rather than quietly running some other case.
+    pub replay_case: Option<u32>,
 }
 
 impl Default for FuzzConfig {
@@ -94,6 +111,8 @@ impl Default for FuzzConfig {
             persist_failures: false,
             report_path: None,
             verbose: 0,
+            rejection_warning_ratio: Some(0.5),
+            replay_case: None,
         }
     }
 }
@@ -109,6 +128,7 @@ impl FuzzConfig {
     /// | `SOROBAN_FUZZ_SEED` | Fixed RNG seed |
     /// | `SOROBAN_FUZZ_MAX_ACTIONS` | Maximum actions per sequence |
     /// | `SOROBAN_FUZZ_REPORT` | Path for the JSON failure report |
+    /// | `SOROBAN_FUZZ_REPLAY` | Run only this case of the seeded sequence |
     ///
     /// Unparsable values are ignored and fall back to the default, so a malformed
     /// CI variable can never turn a green run red.
@@ -122,6 +142,9 @@ impl FuzzConfig {
         }
         if let Some(seed) = env_parse::<u64>("SOROBAN_FUZZ_SEED") {
             config.seed = Some(seed);
+        }
+        if let Some(index) = env_parse::<u32>("SOROBAN_FUZZ_REPLAY") {
+            config.replay_case = Some(index);
         }
         if let Ok(path) = std::env::var("SOROBAN_FUZZ_REPORT") {
             if !path.is_empty() {
@@ -183,6 +206,22 @@ impl FuzzConfig {
     /// Sets proptest verbosity.
     pub fn verbose(mut self, verbose: u32) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    /// Sets the fraction of unexpectedly-rejected actions at which to warn, or `None`
+    /// to disable the warning.
+    pub fn rejection_warning_ratio(mut self, ratio: Option<f64>) -> Self {
+        self.rejection_warning_ratio = ratio;
+        self
+    }
+
+    /// Runs only case `index` of the seeded sequence.
+    ///
+    /// Pair this with [`FuzzConfig::seed`]; on its own it aborts, because a case index
+    /// without a seed does not name the same case twice.
+    pub fn replay_case(mut self, index: u32) -> Self {
+        self.replay_case = Some(index);
         self
     }
 

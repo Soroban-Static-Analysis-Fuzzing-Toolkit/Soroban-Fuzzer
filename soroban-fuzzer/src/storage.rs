@@ -15,7 +15,7 @@
 //! attributing them to a contract. Reading the host directly works at any point in
 //! a fuzz action and keeps entries keyed by owning contract.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
@@ -121,7 +121,65 @@ impl StorageSnapshot {
     ///
     /// Never panics: if the host cannot enumerate its entries, an empty snapshot is
     /// returned, which degrades to "no storage observed" rather than failing a run.
+    ///
+    /// This reads the **whole** ledger. A run that only cares about particular
+    /// contracts should use [`StorageSnapshot::capture_scoped`], which is what the
+    /// runner does when a target declares its
+    /// [`tracked_contracts`](crate::Target::tracked_contracts).
     pub fn capture(env: &Env) -> Self {
+        Self::capture_filtered(env, None)
+    }
+
+    /// Captures only the entries owned by `contracts`.
+    ///
+    /// Capture cost is linear in the total number of ledger entries, and
+    /// [`Runtime::call`](crate::Runtime::call) takes two snapshots per instrumented
+    /// call, so on a contract with large state most of a case's budget can go on
+    /// snapshotting entries the invariants will never look at. Scoping to the
+    /// contracts under test keeps that cost proportional to what is being checked.
+    ///
+    /// An empty `contracts` means "no scoping" and is equivalent to
+    /// [`StorageSnapshot::capture`]: a target that names nothing gets the whole
+    /// ledger rather than a snapshot that silently sees nothing.
+    ///
+    /// # Which contracts to name
+    ///
+    /// Name **every** contract the run touches, directly or through a nested call.
+    /// An entry belonging to a contract that was not named is invisible to
+    /// invariants and to the read-only guard in
+    /// [`runner::check_invariants`](crate::runner), so under-naming narrows what the
+    /// harness is able to notice.
+    pub fn capture_scoped(env: &Env, contracts: &[Address]) -> Self {
+        match filter_for(contracts) {
+            Some(filter) => Self::capture_filtered(env, Some(&filter)),
+            None => Self::capture_filtered(env, None),
+        }
+    }
+
+    /// The subset of this snapshot owned by `contracts`.
+    ///
+    /// The filtering counterpart of [`StorageSnapshot::capture_scoped`], for callers
+    /// that already hold a full snapshot. An empty `contracts` returns a copy of the
+    /// whole snapshot, matching the empty-means-unscoped rule.
+    pub fn scoped(&self, contracts: &[Address]) -> Self {
+        let Some(filter) = filter_for(contracts) else {
+            return self.clone();
+        };
+        let mut entries: BTreeMap<StoreKind, EntryMap> = BTreeMap::new();
+        for (kind, map) in &self.entries {
+            let kept: EntryMap = map
+                .iter()
+                .filter(|((address, _), _)| filter.contains(address))
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect();
+            if !kept.is_empty() {
+                entries.insert(*kind, kept);
+            }
+        }
+        Self { entries }
+    }
+
+    fn capture_filtered(env: &Env, filter: Option<&BTreeSet<ScAddress>>) -> Self {
         let mut entries: BTreeMap<StoreKind, EntryMap> = BTreeMap::new();
 
         let Ok(stored) = env.host().get_stored_entries() else {
@@ -138,6 +196,11 @@ impl StorageSnapshot {
             let LedgerEntryData::ContractData(data) = &entry.data else {
                 continue;
             };
+            if let Some(filter) = filter {
+                if !filter.contains(&data.contract) {
+                    continue;
+                }
+            }
 
             match &data.key {
                 // A contract instance entry carries its instance storage inline.
@@ -227,6 +290,14 @@ impl StorageSnapshot {
     }
 }
 
+/// The owner filter for a contract list, or `None` for "no scoping".
+fn filter_for(contracts: &[Address]) -> Option<BTreeSet<ScAddress>> {
+    if contracts.is_empty() {
+        return None;
+    }
+    Some(contracts.iter().map(ScAddress::from).collect())
+}
+
 fn count_for(entries: &EntryMap, contract: &ScAddress) -> usize {
     entries.keys().filter(|(addr, _)| addr == contract).count()
 }
@@ -287,6 +358,47 @@ impl StorageDelta {
             StoreKind::Instance => &self.instance,
             StoreKind::Persistent => &self.persistent,
             StoreKind::Temporary => &self.temporary,
+        }
+    }
+
+    /// A one-line summary naming each durability that changed and the entries in it.
+    ///
+    /// ```
+    /// # use soroban_fuzzer::storage::{StorageDelta, ChangeSet};
+    /// let delta = StorageDelta {
+    ///     persistent: ChangeSet { updated: 2, changed_keys: vec!["\"bal\"".into()], ..Default::default() },
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(delta.summary(), "persistent: 2 updated [\"bal\"]");
+    /// ```
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        for kind in StoreKind::ALL {
+            let set = self.of(kind);
+            if set.is_empty() {
+                continue;
+            }
+            let mut counts = Vec::new();
+            if set.added > 0 {
+                counts.push(format!("{} added", set.added));
+            }
+            if set.removed > 0 {
+                counts.push(format!("{} removed", set.removed));
+            }
+            if set.updated > 0 {
+                counts.push(format!("{} updated", set.updated));
+            }
+            let keys = if set.changed_keys.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", set.changed_keys.join(", "))
+            };
+            parts.push(format!("{kind}: {}{keys}", counts.join(", ")));
+        }
+        if parts.is_empty() {
+            "no storage writes".to_owned()
+        } else {
+            parts.join("; ")
         }
     }
 }

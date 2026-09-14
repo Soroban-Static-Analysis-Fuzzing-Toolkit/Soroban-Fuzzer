@@ -11,12 +11,13 @@ pub use core::fmt::Debug;
 
 pub use soroban_sdk::Env;
 
+pub use crate::arbitrary_bridge::{from_arbitrary, from_arbitrary_with};
 pub use crate::budget::{mainnet_limits, InvocationResourceLimits, LimitBreach, ResourceUsage};
 pub use crate::config::{AuthPolicy, FuzzConfig, ResourcePolicy};
 pub use crate::invariant::{
     CheckCtx, FnInvariant, Invariant, StorageGrowthBounded, SupplyConserved, SupplyReader,
 };
-pub use crate::report::{FailureReport, FuzzOutcome, Journal, StepRecord};
+pub use crate::report::{ActionStats, FailureReport, FuzzOutcome, Journal, StepRecord};
 pub use crate::runner::{check, run};
 pub use crate::runtime::{CallResult, LedgerCtl, Runtime, StepOutcome};
 pub use crate::storage::{

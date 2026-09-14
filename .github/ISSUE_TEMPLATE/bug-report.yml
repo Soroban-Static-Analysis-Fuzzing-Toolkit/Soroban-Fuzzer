@@ -1,0 +1,86 @@
+name: Bug report
+description: The harness did something wrong — a missed finding, a false one, or a crash.
+title: ""
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A false positive (a finding you have read and disagree with) and a false
+        negative (a bug the harness walked past) are both worth filing. Both are
+        easier to act on with the details below.
+
+  - type: input
+    id: what-ran
+    attributes:
+      label: What you ran
+      description: The command, and the crate or test file it is in.
+      placeholder: cargo test -p soroban-fuzzer --test third_party
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `cargo --version` and `rustc --version`, plus the soroban-sdk version.
+    validations:
+      required: true
+
+  - type: textarea
+    id: contract-shape
+    attributes:
+      label: The contract, or target, shape
+      description: >-
+        What the contract does that matters here — which entrypoint, which storage
+        durabilities, and whether it declares a typed error. A minimal reproduction is
+        ideal, an excerpt is fine.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected versus actual
+      placeholder: |
+        I expected the missing `require_auth` in `set_fee_bps` to be reported.
+        Instead the run passed with "no findings in 256 cases".
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Seed and minimal reproducer
+      description: >-
+        For a fuzz run, paste the seed from the report and the reported minimal
+        sequence. The seed makes it reproducible with
+        `FuzzConfig::default().seed(...)`, and `FuzzConfig::replay_case(n)` reruns just
+        that case. If a finding *shrunk* wrongly — to an action the generator could
+        never have produced, for instance — say so explicitly: that is a distinct and
+        important class of bug, and the reproducer is the evidence.
+    validations:
+      required: false
+
+  - type: textarea
+    id: output
+    attributes:
+      label: The report or output
+      description: The rendered failure report, or the panel of the run that surprised you.
+      render: text
+    validations:
+      required: false
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: How much does this matter?
+      options:
+        - A missed finding — the harness passed something it should have caught
+        - A false finding — the harness reported something that is not a bug
+        - A wrong reproducer — the finding is real, the minimal sequence is not
+        - A crash or refusal to run
+        - Something else
+    validations:
+      required: true

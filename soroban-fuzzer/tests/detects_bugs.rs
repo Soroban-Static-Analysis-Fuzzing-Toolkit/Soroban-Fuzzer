@@ -213,6 +213,65 @@ fn detects_unbounded_storage_growth() {
     );
 }
 
+/// A storage-growth finding says *which* entries grew, not merely that storage did.
+///
+/// "storage grew past 3 entries" tells the reader nothing they can act on. The journal
+/// already computes a full delta per call; this asserts it reaches the report, both as
+/// structure and as text.
+#[test]
+fn the_storage_growth_report_names_the_entries_that_grew() {
+    let outcome = run(
+        StorageTarget,
+        FuzzConfig::default().cases(8).actions(1, 4).seed(23),
+    );
+    let report = outcome
+        .report()
+        .expect("unbounded storage growth must be detected");
+
+    // Structurally: the changed keys are carried per call, per durability.
+    let instance_keys: Vec<&str> = report
+        .steps
+        .iter()
+        .flat_map(|step| &step.calls)
+        .flat_map(|call| call.delta.instance.changed_keys.iter())
+        .map(String::as_str)
+        .collect();
+    let persistent_keys: Vec<&str> = report
+        .steps
+        .iter()
+        .flat_map(|step| &step.calls)
+        .flat_map(|call| call.delta.persistent.changed_keys.iter())
+        .map(String::as_str)
+        .collect();
+
+    // `HoarderVault::record` bumps an instance counter and appends a persistent entry.
+    assert!(
+        instance_keys.iter().any(|key| key.contains("count")),
+        "the instance counter should be named; got {instance_keys:?}\n{}",
+        report.pretty()
+    );
+    assert!(
+        persistent_keys.iter().any(|key| key.contains("log")),
+        "the appended log entry should be named; got {persistent_keys:?}\n{}",
+        report.pretty()
+    );
+
+    // And in the rendered report, where a reader will actually see it.
+    let rendered = report.pretty();
+    assert!(
+        rendered.contains("storage:"),
+        "the report should list what storage each call touched:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("persistent:"),
+        "the report should name the durability that grew:\n{rendered}"
+    );
+    assert!(
+        report.to_json().contains("changed_keys"),
+        "the JSON report should carry the changed keys"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Resource-budget blowout
 // ---------------------------------------------------------------------------

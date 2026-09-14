@@ -137,6 +137,12 @@ impl Target for TokenTarget {
         }
     }
 
+    // Only this contract has state in the environment, so every snapshot can skip
+    // everything else in the ledger.
+    fn tracked_contracts(&self, world: &World) -> Vec<Address> {
+        vec![world.contract.clone()]
+    }
+
     fn invariants(&self) -> Vec<Box<dyn Invariant<Self>>> {
         vec![
             // No coins are created or destroyed by a transfer.
@@ -200,12 +206,13 @@ into `CallResult<V>`, and the conversion you choose expresses your intent:
 | --- | --- |
 | `into_step()` | Calls whose failure is routine |
 | `expect_ok()` | Calls that must succeed for the input to be meaningful |
-| `expect_rejected()` | Negative tests: authorization that must not be granted |
+| `expect_rejected()` | Negative tests: a call that must not go through |
 | `expect_contract_error()` | Asserting a business error rather than a trap |
 
 `expect_rejected()` accepts both a declared contract error and a host-level trap,
 because a failed `require_auth` surfaces as either depending on whether the entrypoint
-declares a typed error. `tests/classification.rs` pins those shapes down.
+declares a typed error. `tests/classification.rs` pins those shapes down — along with a
+measurement that is worth knowing before writing a negative test, below.
 
 **Invariants** are checked after every action and on the initial state. `FnInvariant`
 covers the general case; `SupplyConserved` and `StorageGrowthBounded` cover two
@@ -219,6 +226,86 @@ built-in shorthand for "this address authorizes this entrypoint with exactly the
 arguments". No helper needs to be written per target. `Runtime::install_auths` takes raw
 `MockAuth` values for credential trees, which is what a call that authorizes onward
 sub-invocations needs — see `tests/third_party.rs` for a worked example.
+
+**Scoping.** `Target::tracked_contracts` names the contracts a run cares about, with an
+empty list (the default) meaning "the whole ledger". See [Performance](#performance) for
+why this is the biggest lever on throughput, and name *every* contract the run touches:
+entries belonging to a contract that is not named are invisible to your invariants and to
+the read-only guard.
+
+**Ledger boundaries.** `rt.ledger().advance(n)` moves the clock within the current
+transaction; `rt.ledger().close_ledger(n)` ends it and starts a new ledger, which is
+where the network applies rent and TTL expiry. See [Multi-ledger
+scenarios](#multi-ledger-scenarios).
+
+## Negative authorization tests: why `expect_rejected` is not enough
+
+The default `AuthPolicy::Strict` means a privileged entrypoint with no credentials is
+refused, so `call_without_auth(...).expect_rejected()` looks like a complete test. It is
+not, and the reason is a property of the environment rather than a gap in the harness.
+
+**A failed `require_auth` and a contract that merely panics are indistinguishable at
+the error level.** Measured against `soroban-sdk` 27 and pinned in
+`tests/classification.rs`:
+
+| Entrypoint | Failed `require_auth` | Plain `panic!` |
+| --- | --- | --- |
+| Declares no error type | `Err(Ok(Error(Context, InvalidAction)))` | *identical* |
+| Declares a typed error | `Err(Err(InvokeError::Abort))` | *identical* |
+
+The `Error` in the first row is not even typed as an authorization error: its
+`is_type(ScErrorType::Auth)` is `false`. So no inspection of the returned error can tell
+"refused because the caller was not authorized" from "panicked before it ever looked at
+authorization" — and a negative test built on the error therefore passes for the wrong
+reason whenever the entrypoint refuses on its input first.
+
+`Runtime::call_requiring_auth` asserts the property **positively** instead. It switches
+the host to recording authorization, runs the call, and reads the authorization tree the
+contract actually demanded:
+
+```rust
+// Either form proves `transfer` is gated on `from`'s authorization. This one also
+// proves the balance check did not get in the way, because the call had to succeed.
+rt.call_requiring_auth("transfer", &from, || client.try_transfer(&from, &to, &amount))
+```
+
+It is the mechanism the SDK's own documentation recommends for exactly this question —
+*"a test that uses `mock_all_auths` without verifying the resulting authorization tree
+can pass even when a contract is missing a `require_auth` check"* — turned into one call
+with a finding attached.
+
+Its cost is honest and worth stating: recording authorization means the credential is
+never refused, so **a correctly protected entrypoint runs to completion** and its state
+changes are real. The action's model has to account for that, exactly as it would for any
+positive call, and an entrypoint that fails on its input is reported as a violation
+rather than a pass. `tests/classification.rs` has both directions, plus a test that the
+lenient conversion accepts what the strict one rejects — so the difference between them
+is a fact rather than a claim in this file.
+
+## Multi-ledger scenarios
+
+The default environment gives each case one ledger, which is enough for a great deal and
+not enough for anything the network applies at a ledger boundary: rent, TTL expiry, and
+reclamation of expired temporary entries.
+
+`rt.ledger().close_ledger(n)` ends the transaction and starts the next ledger `n`
+ledgers later. It is distinct from `advance(n)`, which moves the clock *within* the
+current transaction, and it records the boundary in the run's journal so a report shows
+where time moved rather than leaving a two-action reproducer looking like a single
+instant.
+
+What becomes reachable is exactly the class of bug a single-ledger run cannot find. An
+allowance whose deadline is in the past reads as zero because the host has reclaimed the
+expired entry rather than merely left it stale; a temporary entry past its TTL is gone; a
+contract that reads a ledger number once keeps serving it until something forces a
+re-read. `tests/third_party.rs` drives all three stages through the real vendored token
+— approve with a short deadline, close the ledger past it, then spend — and asserts that
+**every** generated sequence reached the spend and had it refused.
+
+One fidelity note, stated rather than glossed: the test host applies expiry *lazily*, on
+the next read, rather than sweeping at close. So in this environment the observable
+difference from `advance` is that the boundary is explicit and journalled, not that state
+is swept here.
 
 ## Preconditions: what keeps shrinking honest
 
@@ -281,35 +368,56 @@ signal and a reported non-breach as reassurance rather than proof.
 runs on the machine that built this crate, against the vendored real token contract,
 and they are quoted as **ranges across those runs** — a single figure would be a lie.
 A shared CI runner is slower and noisier still, which is why CI asserts only that every
-measurement is still reported, never its value.
-
-| Operation | Cost |
+measurement is still reported, never its value.| Operation | Cost |
 | --- | --- |
-| create a test environment | 1.7–1.9 µs |
-| create an environment and deploy the real token | 125–130 µs |
-| `StorageSnapshot::capture`, 1 entry | 1.7–3 µs |
-| `StorageSnapshot::capture`, 16 entries | 18–35 µs |
-| `StorageSnapshot::capture`, 256 entries | 445–560 µs |
-| read the last invocation's resource metering | 3–6 ns |
-| one case of one action, contract work only | 288–294 µs |
-| one case of one action, through the harness | 365–405 µs |
-| one case of eight actions, through the harness | 1.5–2.1 ms |
+| create a test environment | 1.3–2.3 µs |
+| create an environment and deploy the real token | 129–161 µs |
+| `StorageSnapshot::capture`, 1 entry | 1.7–3.1 µs |
+| `StorageSnapshot::capture`, 16 entries | 18–47 µs |
+| `StorageSnapshot::capture`, 256 entries | 363–737 µs |
+| `capture_scoped`, 4 own + 64 foreign entries | 4.9–19 µs |
+| `capture_scoped`, 4 own + 256 foreign entries | 10–29 µs |
+| the same two captures unscoped | 83–269 µs / 407–599 µs |
+| read the last invocation's resource metering | 3.4–8 ns |
+| one case of one action, contract work only | 305–375 µs |
+| one case of one action, through the harness | 365–427 µs |
+| one case of eight actions, through the harness | 1.59–1.93 ms |
 
-In round numbers that is **2,500–2,700 cases/s at one action per case** and
-**470–660 cases/s at eight** — so 10,000 one-action cases is a few seconds of fuzzing.
-The harness's own overhead is ~80–110 µs per case: roughly a quarter of a one-action
-case where the contract is cheap, and negligible once sequences are longer.
+In round numbers that is **2,340–2,740 cases/s at one action per case** and
+**520–630 cases/s at eight** — so 10,000 one-action cases is a few seconds of fuzzing.
+The harness's own overhead is ~60–120 µs per case.
 
-Two numbers are worth planning around rather than quoting:
+Three numbers are worth planning around rather than quoting:
 
 * **Snapshot cost is linear in total ledger entries** and is paid twice per
-  instrumented call. A contract holding 256 persistent entries spends ~0.5 ms per
-  snapshot before it does any work of its own, which is comparable to the whole cost
-  of a small case. Large-state contracts need either longer sequences (so the fixed
-  cost amortises) or a target whose invariants tolerate fewer actions.
+  instrumented call. A contract holding 256 persistent entries spends ~0.4–0.7 ms per
+  snapshot before it does any work of its own, which is comparable to the whole cost of
+  a small case. This is what `Target::tracked_contracts` is for.
+* **Scoping is the lever, and it scales with foreign state.** Capturing only the
+  contracts under test instead of the whole ledger measured **roughly 10–20× faster**
+  with 64–256 entries belonging to another contract, and the ratio grows with that
+  number: a full capture pays for every entry in the environment on every call, a scoped
+  one pays only for its own. It shows up end-to-end only to the extent the environment
+  actually holds foreign state — a single-contract case in a fresh `Env` has almost
+  none, which is why the `run:` rows above are flat across the full and scoped variants
+  while the `capture_scoped` rows are not.
 * **Deploy dominates cheap cases.** A fresh environment and a fresh deployment per case
   is what makes a counterexample trustworthy — nothing leaks between cases — and it is
-the main lever on throughput. It is not a knob; it is the property you are paying for.
+  the main lever on throughput. It is not a knob; it is the property you are paying for.
+
+## Reusing an `Arbitrary` definition
+
+If an action type already derives `arbitrary::Arbitrary` — much Soroban code and internal
+tooling does — you do not have to write a strategy for it:
+
+```rust
+fn actions(&self, _state: &Model) -> BoxedStrategy<Act> {
+    from_arbitrary()
+}
+```
+
+`from_arbitrary()` and `from_arbitrary_with()` turn any `Arbitrary` type into a proptest
+`Strategy`; `tests/diagnostics.rs` drives a target through the bridge end to end.
 
 ## Validated against a real contract
 
@@ -333,6 +441,12 @@ contract — which is exactly what the second half of that file depends on, wher
 small vault composes with the token and the vault's own `i128` bookkeeping sits in the
 same ledger as the token's balances.
 
+The same file also covers the ledger boundary (an allowance written, a ledger closed
+past its deadline, the spend refused) and pins the scoped-capture equivalence against a
+two-contract ledger, including the fact that `mock_all_auths` leaves a temporary nonce
+entry per authorizing address — an entry owned by that address rather than by any
+contract, and correctly excluded from a scoped snapshot.
+
 ## Reproducing and CI
 
 Every run reports the seed it used, and an unpinned run picks one for you. Pin it to
@@ -341,6 +455,19 @@ replay a failure exactly:
 ```rust
 run(TokenTarget, FuzzConfig::default().seed(9719402080364109389));
 ```
+
+Re-running a whole run to reproduce one case is a lot of noise when a target takes
+minutes, so a case can be selected by index. The seed remains the only source of
+randomness — every earlier case is still *generated* and discarded, so the selected case
+is the same one the full run produced:
+
+```rust
+run(TokenTarget, FuzzConfig::default().seed(9719402080364109389).replay_case(37));
+```
+
+An index without a seed is refused rather than answered wrongly, because the index names
+a position in a stream that does not otherwise exist. `tests/diagnostics.rs` asserts the
+equivalence case by case.
 
 `FuzzConfig::from_env()` reads CI-friendly overrides, so a pipeline can widen a run
 without a code change:
@@ -351,6 +478,7 @@ without a code change:
 | `SOROBAN_FUZZ_SEED` | Fixed RNG seed |
 | `SOROBAN_FUZZ_MAX_ACTIONS` | Maximum actions per sequence |
 | `SOROBAN_FUZZ_REPORT` | Path for the JSON failure report |
+| `SOROBAN_FUZZ_REPLAY` | Run only this case of the seeded sequence |
 
 A failure writes a machine-readable report that CI can consume:
 
@@ -360,7 +488,8 @@ outcome.assert_ok();                      // panics with the rendered report
 ```
 
 `FailureReport` serializes to JSON (`kind`, `detail`, `seed`, `minimal_sequence`,
-per-call resource usage) for upload as a build artefact.
+per-call resource usage, the storage each call touched, and the action ratio of the
+cases that led up to the failure) for upload as a build artefact.
 
 This repository's [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) is a working
 example of both halves: a job that formats, lints and tests the workspace in debug and
@@ -375,11 +504,18 @@ firing.
   disabled so a run does not litter `test_snapshots/`.
 - Panic output from shrink iterations suppressed on the running thread, so the report
   is readable. The payload is still captured and included.
-- Ledger control (`rt.ledger().advance(n)`) so TTL and time-based logic is reachable.
+- Ledger control (`rt.ledger().advance(n)`, and `rt.ledger().close_ledger(n)` to cross
+  a ledger boundary) so TTL and time-based logic is reachable.
 - Storage snapshots read from the host directly, keyed by owning contract, so entries
-  from different contracts never collide and reads work outside a contract context.
+  from different contracts never collide and reads work outside a contract context —
+  and scopable to the contracts under test, at a measured 10–20× less work.
 - A guard that fails a case whose invariants wrote to storage, reporting which
   durability and which entries changed.
+- A diagnostic on every passing run: the ratio of accepted to unexpectedly-rejected
+  actions, with a warning when most generated calls were refused. "No findings in 200
+  cases" is only evidence if the cases reached the contract, and the two look identical
+  without it. Negative tests you *meant* to be refused are declared with
+  `Target::expects_rejection` and kept out of the ratio, so the warning stays meaningful.
 
 ## Limitations
 
@@ -407,10 +543,21 @@ temporary entries when reading them — a read-only check can therefore make one
 Nothing else is tolerated: any change to instance or persistent data, and any addition
 or value update in temporary storage, fails the case.
 
-**One contract per chain, per environment.** Cross-contract composition works and is
-tested, but each case runs in a single `Env` that is thrown away afterwards. There is
-no support for multi-transaction or multi-block scenarios beyond advancing the ledger
-(`rt.ledger().advance`).
+**One environment per case.** Cross-contract composition works and is tested, and
+ledger boundaries are supported (`rt.ledger().close_ledger`) for the state the network
+changes at them, but each case still runs in a single `Env` that is thrown away
+afterwards. There is no support for a persistent multi-case ledger, for multiple
+accounts' nonces, or for anything that needs two environments to interact.
+
+**`expect_rejected` cannot tell an authorization refusal from a panic.** This is a
+limitation of the environment, not of the harness — the shapes are byte-identical, as
+the table above shows. Use `call_requiring_auth` when it matters; the lenient form is
+fine when the only property you need is "the call did not go through".
+
+**The read-only guard is scoped when the run is scoped.** A change an invariant makes to
+a *contract you did not name in `tracked_contracts`* is invisible to the guard. The
+default (name nothing) captures the whole ledger and is the safe direction; under-naming
+narrows what the harness can notice.
 
 ## Status and API stability
 
@@ -422,7 +569,9 @@ version — treat every 0.x minor bump as potentially breaking.
 This crate is the property-fuzzer component of a larger toolkit. The static analyser
 (detector engine, resource-budget estimator, SARIF output for PR review) is a separate
 component and is not in this repository yet. Detector-per-PR contributions are the
-intended development model, so scoped issues and focused pull requests are welcome.
+intended development model, so scoped issues and focused pull requests are welcome —
+see [`CONTRIBUTING.md`](../CONTRIBUTING.md), which also states the bar a detector has to
+clear (a fixture proving it fires, and one proving it does not over-fire).
 
 ## License
 

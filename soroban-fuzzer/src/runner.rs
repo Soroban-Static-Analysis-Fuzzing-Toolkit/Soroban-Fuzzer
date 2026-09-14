@@ -17,7 +17,8 @@
 //!   a counterexample meaningful, and it is also why snapshot capture at `Env` drop
 //!   is disabled: a run of 128 cases should not litter `test_snapshots/`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -26,13 +27,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use proptest::test_runner::{Config as ProptestConfig, RngSeed, TestError, TestRunner};
 use proptest_state_machine::Sequential;
 use soroban_sdk::testutils::EnvTestConfig;
-use soroban_sdk::Env;
+use soroban_sdk::{Address, Env};
 
 use crate::config::{AuthPolicy, FuzzConfig, ResourcePolicy};
 use crate::invariant::{CheckCtx, Invariant};
-use crate::report::{FailureReport, FuzzOutcome, Journal};
+use crate::report::{ActionStats, FailureReport, FuzzOutcome, Journal};
 use crate::runtime::{Runtime, StepOutcome};
-use crate::storage::{StorageSnapshot, StoreKind};
+use crate::storage::StorageSnapshot;
 use crate::target::Target;
 
 /// Fuzzes `target` and returns what happened.
@@ -62,10 +63,23 @@ pub fn run<T>(target: T, mut config: FuzzConfig) -> FuzzOutcome
 where
     T: Target + Send + Sync + 'static,
 {
+    // Replaying a single case is only meaningful against a pinned seed: the index
+    // names a position in the stream of generated cases, and without a seed that
+    // stream is different on every run. Refusing here is the difference between a
+    // clear error and a confident wrong answer.
+    if config.replay_case.is_some() && config.seed.is_none() {
+        return FuzzOutcome::Aborted {
+            reason: "FuzzConfig::replay_case needs a pinned seed: without one the case index \
+                     names a different sequence on every run. Set FuzzConfig::seed(...) as well."
+                .to_owned(),
+        };
+    }
+
     if config.seed.is_none() {
         config.seed = Some(fresh_seed());
     }
     let seed = config.seed.unwrap_or_default();
+    let replay_case = config.replay_case;
 
     let target = Arc::new(target);
     let config = Arc::new(config);
@@ -86,8 +100,17 @@ where
         )
     };
 
+    // When replaying, generate every case up to the one wanted and execute only that
+    // one. Generation is what advances the RNG, so stopping early would produce a
+    // different case than the full run did; running the same number of steps and
+    // discarding the earlier results is what makes the two agree.
+    let cases_to_generate = match replay_case {
+        Some(index) => index.saturating_add(1),
+        None => config.cases,
+    };
+
     let mut proptest_config = ProptestConfig {
-        cases: config.cases,
+        cases: cases_to_generate,
         max_shrink_iters: config.max_shrink_iters,
         verbose: config.verbose,
         rng_seed: RngSeed::Fixed(seed),
@@ -111,9 +134,25 @@ where
     let case_target = Arc::clone(&target);
     let case_config = Arc::clone(&config);
     let case_journal = Rc::clone(&journal);
+    // Accumulated across cases rather than per case: what matters is whether the run as
+    // a whole produced actions the contract would take.
+    let tally = Rc::new(RefCell::new(Tally::default()));
+    let for_tally = Rc::clone(&tally);
+    let case_index = Rc::new(Cell::new(0u32));
+    let for_index = Rc::clone(&case_index);
 
     let result = runner.run(&sequential, move |(initial, actions, seen)| {
-        run_case(
+        let index = for_index.get();
+        for_index.set(index.saturating_add(1));
+        if let Some(wanted) = replay_case {
+            if index != wanted {
+                // Still generated, so the RNG has advanced exactly as it did in the
+                // full run; deliberately not executed.
+                return Ok(());
+            }
+        }
+
+        let case = run_case(
             case_target.as_ref(),
             case_config.as_ref(),
             &case_journal,
@@ -121,14 +160,25 @@ where
             actions,
             seen,
         );
+        for_tally.borrow_mut().absorb(&case);
         Ok(())
     });
 
+    let cases_run = match replay_case {
+        Some(_) => 1,
+        None => config.cases,
+    };
+
     match result {
-        Ok(()) => FuzzOutcome::Passed {
-            cases: config.cases,
-            seed,
-        },
+        Ok(()) => {
+            let tally = tally.borrow();
+            FuzzOutcome::Passed {
+                cases: cases_run,
+                seed,
+                stats: tally.stats,
+                warning: tally.warning(config.rejection_warning_ratio),
+            }
+        }
         Err(TestError::Abort(reason)) => FuzzOutcome::Aborted {
             reason: reason.message().to_owned(),
         },
@@ -137,11 +187,15 @@ where
                 .iter()
                 .map(|action| target.describe(action))
                 .collect::<Vec<_>>();
+            // The cases that completed before the failing one. The failing case itself
+            // never reaches `absorb`, so its actions are in the journal below instead.
+            let stats = tally.borrow().stats;
             let report = FailureReport::new(
                 reason.message().to_owned(),
                 minimal_sequence,
                 &journal.borrow(),
                 config.as_ref(),
+                stats,
             );
             if let Some(path) = &config.report_path {
                 // Reporting must never turn a finding into a different failure.
@@ -181,6 +235,75 @@ where
     run(target, config).assert_ok()
 }
 
+/// What the cases of a run add up to.
+#[derive(Debug, Default)]
+struct Tally {
+    stats: ActionStats,
+    /// How often each action *kind* was rejected unexpectedly. Keyed by
+    /// [`Target::action_kind`](crate::Target::action_kind) rather than by the rendered
+    /// action, because a rendered action embeds its generated values and so would never
+    /// group.
+    unexpected_rejections_by_kind: BTreeMap<String, u64>,
+}
+
+impl Tally {
+    fn absorb(&mut self, case: &CaseTally) {
+        self.stats.accepted += case.stats.accepted;
+        self.stats.expected_rejections += case.stats.expected_rejections;
+        self.stats.unexpected_rejections += case.stats.unexpected_rejections;
+        for kind in &case.unexpected_rejection_kinds {
+            *self
+                .unexpected_rejections_by_kind
+                .entry(kind.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
+    /// The diagnostic a run raises, if any.
+    ///
+    /// Deliberately based on *unexpected* rejections only: a target that generates a
+    /// negative test is refused on purpose, and warning about those would train people
+    /// to ignore the warning.
+    fn warning(&self, threshold: Option<f64>) -> Option<String> {
+        let threshold = threshold?;
+        if self.stats.is_empty() || self.stats.rejection_ratio() <= threshold {
+            return None;
+        }
+
+        // The kind rejected most often, with ties broken by name so the message is
+        // stable across runs of the same seed.
+        let worst = self
+            .unexpected_rejections_by_kind
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)));
+        let focus = match worst {
+            Some((kind, count)) => {
+                format!(" The kind rejected most often was `{kind}` ({count} times).")
+            }
+            None => String::new(),
+        };
+
+        Some(format!(
+            "{:.0}% of generated actions ({}/{}) were rejected by the contract without \
+             the target expecting it.{focus} That usually means the model and the \
+             contract disagree, so these cases exercised less than they appear to. \
+             Either tighten `Target::preconditions`/`Target::actions`, mark deliberate \
+             refusals with `Target::expects_rejection`, or raise \
+             `FuzzConfig::rejection_warning_ratio`.",
+            self.stats.rejection_ratio() * 100.0,
+            self.stats.unexpected_rejections,
+            self.stats.total(),
+        ))
+    }
+}
+
+/// What one case contributed to the run's [`Tally`].
+#[derive(Debug, Default)]
+struct CaseTally {
+    stats: ActionStats,
+    unexpected_rejection_kinds: Vec<String>,
+}
+
 /// Executes one generated sequence against a fresh environment.
 ///
 /// `seen_counter` is the shared counter that `proptest-state-machine` uses to tell
@@ -194,16 +317,21 @@ fn run_case<T>(
     initial: T::State,
     actions: Vec<T::Action>,
     seen_counter: Option<Arc<AtomicUsize>>,
-) where
+) -> CaseTally
+where
     T: Target + Send + Sync + 'static,
 {
     let env = new_env(config);
     let world = target.setup(&env, &initial);
     let invariants = target.invariants();
+    // Computed once, not per call: this is what keeps snapshot capture proportional
+    // to the state under test rather than to the whole ledger.
+    let scoped = target.tracked_contracts(&world);
     journal.borrow_mut().reset();
+    let mut tally = CaseTally::default();
 
     let mut model = initial;
-    check_invariants(&invariants, &env, &world, &model, None, 0, journal);
+    check_invariants(&invariants, &env, &world, &model, None, 0, journal, &scoped);
 
     for (index, action) in actions.into_iter().enumerate() {
         if let Some(counter) = seen_counter.as_ref() {
@@ -220,17 +348,35 @@ fn run_case<T>(
             .begin_step(index, target.describe(&action));
 
         let outcome = {
-            let mut runtime = Runtime::new(&env, &world, Rc::clone(journal), index, config);
+            let mut runtime =
+                Runtime::new(&env, &world, Rc::clone(journal), index, config, &scoped);
             target.execute(&mut runtime, &action)
         };
 
         journal.borrow_mut().finish_step(outcome.describe());
 
-        if let StepOutcome::Violation(detail) = &outcome {
-            journal
-                .borrow_mut()
-                .fail("unexpected-error", detail.clone());
-            fail_case(journal);
+        match &outcome {
+            StepOutcome::Ok => tally.stats.accepted += 1,
+            StepOutcome::Rejected(_) => {
+                // The harness cannot tell a deliberate negative test from a model that
+                // disagrees with the contract, so only the target can say which a
+                // refusal is. Without that, every target with a negative test would
+                // look like a broken model.
+                if target.expects_rejection(&action) {
+                    tally.stats.expected_rejections += 1;
+                } else {
+                    tally.stats.unexpected_rejections += 1;
+                    tally
+                        .unexpected_rejection_kinds
+                        .push(target.action_kind(&action));
+                }
+            }
+            StepOutcome::Violation(detail) => {
+                journal
+                    .borrow_mut()
+                    .fail("unexpected-error", detail.clone());
+                fail_case(journal);
+            }
         }
 
         check_invariants(
@@ -241,10 +387,14 @@ fn run_case<T>(
             Some(&action),
             index,
             journal,
+            &scoped,
         );
     }
+
+    tally
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_invariants<T>(
     invariants: &[Box<dyn Invariant<T>>],
     env: &Env,
@@ -253,6 +403,7 @@ fn check_invariants<T>(
     action: Option<&T::Action>,
     step: usize,
     journal: &Rc<RefCell<Journal>>,
+    scoped: &[Address],
 ) where
     T: Target,
 {
@@ -264,7 +415,7 @@ fn check_invariants<T>(
     // contract under test would be mutated by the checker, and a post-action
     // snapshot could never be trusted. Detect it rather than let it produce a
     // confusing, non-reproducible finding.
-    let before = StorageSnapshot::capture(env);
+    let before = StorageSnapshot::capture_scoped(env, scoped);
 
     for invariant in invariants {
         if action.is_none() && !invariant.check_initial() {
@@ -285,7 +436,7 @@ fn check_invariants<T>(
         }
     }
 
-    let after = StorageSnapshot::capture(env);
+    let after = StorageSnapshot::capture_scoped(env, scoped);
     let delta = before.diff(&after);
 
     // One change is not the checker's doing. The host reclaims an expired temporary
@@ -302,34 +453,16 @@ fn check_invariants<T>(
         && delta.temporary.updated == 0;
 
     if !delta.is_empty() && !host_reclaimed {
-        // Report what changed, per durability, rather than only how many entries did.
-        // A bare count is unactionable when the offending invariant is one of several,
-        // and it hides the difference between "reached a setter" (values updated) and
-        // "reached a lifecycle operation" (entries added or removed).
-        let mut changes = Vec::new();
-        for kind in StoreKind::ALL {
-            let set = delta.of(kind);
-            if set.is_empty() {
-                continue;
-            }
-            changes.push(format!(
-                "{kind}: {} added, {} removed, {} updated{}",
-                set.added,
-                set.removed,
-                set.updated,
-                if set.changed_keys.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", set.changed_keys.join(", "))
-                }
-            ));
-        }
+        // Report what changed by durability *and by entry*, not just how many entries
+        // did: a bare count is unactionable when the offending invariant is one of
+        // several, and it hides the difference between "reached a setter" (values
+        // updated) and "reached a lifecycle operation" (entries added or removed).
         journal.borrow_mut().fail(
             "invariant",
             format!(
                 "checking invariants modified contract state ({}); invariants must be \
                  read-only, so this makes results non-reproducible",
-                changes.join("; ")
+                delta.summary()
             ),
         );
         fail_case(journal);

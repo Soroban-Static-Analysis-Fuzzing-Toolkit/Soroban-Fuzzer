@@ -105,19 +105,24 @@ fn fresh_env() -> Env {
     })
 }
 
-/// Deploys the vendored token and returns `(env, contract)`.
-fn deploy_token() -> (Env, Address) {
-    let env = fresh_env();
-    let admin = Address::generate(&env);
-    let contract = env.register(
+/// Registers the vendored token in an existing environment.
+fn register_token(env: &Env) -> Address {
+    let admin = Address::generate(env);
+    env.register(
         Token,
         (
             admin,
             7u32,
-            SdkString::from_str(&env, "Bench"),
-            SdkString::from_str(&env, "BNC"),
+            SdkString::from_str(env, "Bench"),
+            SdkString::from_str(env, "BNC"),
         ),
-    );
+    )
+}
+
+/// Deploys the vendored token and returns `(env, contract)`.
+fn deploy_token() -> (Env, Address) {
+    let env = fresh_env();
+    let contract = register_token(&env);
     (env, contract)
 }
 
@@ -132,6 +137,31 @@ fn deploy_token_with_balances(count: u32) -> (Env, Address) {
         client.mint(&holder, &10_000i128);
     }
     (env, contract)
+}
+
+/// Deploys the token under test alongside a second, unrelated contract that holds
+/// `noise` entries of its own.
+///
+/// Scoping only pays off when there is something to leave out, and in a real
+/// deployment there is: a composed system has several contracts in the same ledger,
+/// and every entry any of them holds is an entry a full capture walks. The second
+/// token stands in for that, and returning it separately keeps the subject
+/// undistinguishable from the noise.
+fn deploy_token_beside_noise(count: u32, noise: u32) -> (Env, Address, Address) {
+    let env = fresh_env();
+    let contract = register_token(&env);
+    let other = register_token(&env);
+
+    env.mock_all_auths();
+    let subject = TokenClient::new(&env, &contract);
+    for _ in 0..count {
+        subject.mint(&Address::generate(&env), &10_000i128);
+    }
+    let nuisance = TokenClient::new(&env, &other);
+    for _ in 0..noise {
+        nuisance.mint(&Address::generate(&env), &10_000i128);
+    }
+    (env, contract, other)
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +186,8 @@ struct World {
 struct TokenTarget {
     /// Invariants add per-step work; measuring with and without shows its cost.
     check_storage: bool,
+    /// Whether to scope storage snapshots to the contract under test.
+    scoped: bool,
 }
 
 impl Target for TokenTarget {
@@ -209,6 +241,15 @@ impl Target for TokenTarget {
         let client = TokenClient::new(rt.env(), &contract);
         rt.call("transfer", || client.try_transfer(&from, &to, amount))
             .expect_ok()
+    }
+
+    /// Scoping the run to the contract under test, or not.
+    fn tracked_contracts(&self, world: &World) -> Vec<Address> {
+        if self.scoped {
+            vec![world.contract.clone()]
+        } else {
+            Vec::new()
+        }
     }
 
     fn invariants(&self) -> Vec<Box<dyn Invariant<Self>>> {
@@ -265,6 +306,31 @@ fn main() {
         );
     }
 
+    // The same two shapes side by side with another contract in the ledger, which is
+    // the case scoping is for. Both rows walk the same environment, so the difference
+    // between them is exactly the saving: a full capture pays for the other
+    // contract's entries on every call, a scoped one does not.
+    for noise in [64u32, 256] {
+        let (env, contract, _other) = deploy_token_beside_noise(4, noise);
+        let subject = std::slice::from_ref(&contract);
+        measure(
+            "storage: capture full (4 own + noise)",
+            200,
+            format!("{noise} entries owned by another contract"),
+            || {
+                black_box(StorageSnapshot::capture(&env));
+            },
+        );
+        measure(
+            "storage: capture scoped to the contract",
+            200,
+            format!("skipping that contract's {noise} entries"),
+            || {
+                black_box(StorageSnapshot::capture_scoped(&env, subject));
+            },
+        );
+    }
+
     // --- Metering and a real entrypoint ---------------------------------------
     let (env, _contract) = deploy_token_with_balances(4);
     measure("metering: read last invocation usage", 20_000, "", || {
@@ -294,17 +360,18 @@ fn main() {
     // Every case builds a fresh environment, registers the contract, runs its
     // actions, checks invariants and tears the environment down. This is the number
     // that decides whether a CI budget is realistic.
-    let report = |cases: u32, actions: usize, invariants: bool| {
+    let report = |cases: u32, actions: usize, invariants: bool, scoped: bool| {
         let label = format!("run: {cases} cases x {actions} actions");
-        let note = if invariants {
-            "with storage-growth invariant"
-        } else {
-            "no invariants"
+        let note = match (invariants, scoped) {
+            (true, true) => "storage-growth invariant, scoped capture",
+            (true, false) => "storage-growth invariant, full capture",
+            (false, _) => "no invariants",
         };
         measure_units(&label, 3, cases as u64, note, || {
             let outcome = run(
                 TokenTarget {
                     check_storage: invariants,
+                    scoped,
                 },
                 FuzzConfig::default()
                     .cases(cases)
@@ -318,9 +385,10 @@ fn main() {
         });
     };
 
-    report(200, 1, false);
-    report(200, 1, true);
-    report(50, 8, true);
+    report(200, 1, false, false);
+    report(200, 1, true, false);
+    report(200, 1, true, true);
+    report(50, 8, true, true);
 
     println!("{rule}");
     println!(

@@ -103,6 +103,7 @@ jobs:
           for row in \
             "env: create" \
             "storage: capture snapshot" \
+            "storage: capture scoped to the contract" \
             "metering: read last invocation usage" \
             "case floor" \
             "run:"

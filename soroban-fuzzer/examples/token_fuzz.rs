@@ -313,6 +313,16 @@ impl Target for TokenTarget {
         }
     }
 
+    /// Only the token under test has state here, so every snapshot can be scoped to it.
+    ///
+    /// Capture cost is linear in the entries the environment holds, and the harness
+    /// takes two snapshots per instrumented call, so naming the contracts the run
+    /// cares about is the single biggest lever on throughput for a contract with real
+    /// state. See `cargo bench` for the measurement.
+    fn tracked_contracts(&self, world: &World) -> Vec<Address> {
+        vec![world.contract.clone()]
+    }
+
     fn invariants(&self) -> Vec<Box<dyn Invariant<Self>>> {
         vec![
             // The contract's balances must equal the model's, and the total supply
@@ -352,8 +362,20 @@ impl Target for TokenTarget {
 fn summarize(label: &str, outcome: &FuzzOutcome) {
     println!("== {label} ==");
     match outcome {
-        FuzzOutcome::Passed { cases, seed } => {
-            println!("no findings in {cases} cases (seed {seed})\n");
+        FuzzOutcome::Passed {
+            cases,
+            seed,
+            stats,
+            warning,
+        } => {
+            println!("no findings in {cases} cases (seed {seed})");
+            // "no findings" is only meaningful if the generated actions reached the
+            // contract, so always report what happened to them.
+            println!("{stats}");
+            if let Some(warning) = warning {
+                println!("warning: {warning}");
+            }
+            println!();
         }
         FuzzOutcome::Failed(report) => {
             println!("{report}");

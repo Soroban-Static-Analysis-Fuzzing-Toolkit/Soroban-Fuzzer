@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::{LimitBreach, ResourceUsage};
 use crate::config::FuzzConfig;
+use crate::storage::StorageDelta;
 
 /// What one contract invocation did, as recorded by the harness.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -24,12 +25,23 @@ pub struct CallRecord {
     pub outcome: String,
     /// Resources the invocation consumed.
     pub usage: ResourceUsage,
-    /// Ledger entries the invocation wrote.
-    pub writes: usize,
+    /// What the invocation changed in ledger storage, by durability, including the
+    /// rendered keys of the entries it touched.
+    ///
+    /// Carried in full rather than as a count: a storage-growth finding whose report
+    /// says "storage grew" but not *which entries* grew leaves the reader to guess.
+    pub delta: StorageDelta,
     /// Total tracked storage entries after the invocation.
     pub entries_after: usize,
     /// A network limit the invocation exceeded, if any.
     pub breach: Option<LimitBreach>,
+}
+
+impl CallRecord {
+    /// Ledger entries the invocation wrote.
+    pub fn writes(&self) -> usize {
+        self.delta.writes()
+    }
 }
 
 /// One action of a fuzz case, plus every call it made.
@@ -72,7 +84,7 @@ impl StepRecord {
 
     /// Ledger entries written across this step's calls.
     pub fn writes(&self) -> usize {
-        self.calls.iter().map(|call| call.writes).sum()
+        self.calls.iter().map(CallRecord::writes).sum()
     }
 
     /// The first breach recorded by this step, if any.
@@ -217,6 +229,14 @@ pub struct FailureReport {
     pub minimal_sequence: Vec<String>,
     /// Full journal of the minimized case.
     pub steps: Vec<StepRecord>,
+    /// How the generated actions fared in the cases that completed before this one.
+    ///
+    /// Carried in a failure report for the same reason it is on a passing outcome: a
+    /// finding built out of calls the contract kept refusing proves less than it looks
+    /// like. It describes the run *up to* the failure — the failing case aborted before
+    /// its own actions could be tallied, and those are in [`FailureReport::steps`]
+    /// instead — so on a single-case run all three counts are zero.
+    pub stats: ActionStats,
     /// Configuration the run used.
     pub config: ReportConfig,
 }
@@ -228,6 +248,7 @@ impl FailureReport {
         minimal_sequence: Vec<String>,
         journal: &Journal,
         config: &FuzzConfig,
+        stats: ActionStats,
     ) -> Self {
         // A panic inside `execute` never reaches `finish_step`, so mark the step
         // that was in flight rather than leaving it looking unstarted.
@@ -248,6 +269,7 @@ impl FailureReport {
             seed: config.seed,
             minimal_sequence,
             steps,
+            stats,
             config: config.summary(),
         }
     }
@@ -286,6 +308,11 @@ impl FailureReport {
             max = self.config.max_actions,
             auth = self.config.auth,
         );
+        // Only when the run got somewhere: on the first case it fails there is nothing
+        // to report, and a row of zeroes would read as "nothing was refused".
+        if !self.stats.is_empty() {
+            let _ = writeln!(out, "  before this case: {}", self.stats);
+        }
         let _ = writeln!(
             out,
             "  minimal sequence ({} action{}):",
@@ -326,8 +353,16 @@ impl FailureReport {
                     let _ = writeln!(
                         out,
                         "        call `{}`: {} [cpu={}, writes={}]",
-                        call.label, call.outcome, call.usage.instructions, call.writes
+                        call.label,
+                        call.outcome,
+                        call.usage.instructions,
+                        call.writes()
                     );
+                    // Naming the entries is the difference between "storage grew" and
+                    // "these two balance entries grew".
+                    if !call.delta.is_empty() {
+                        let _ = writeln!(out, "          storage: {}", call.delta.summary());
+                    }
                     if let Some(breach) = &call.breach {
                         let _ = writeln!(out, "          ! {breach}");
                     }
@@ -361,6 +396,67 @@ impl fmt::Display for FailureReport {
     }
 }
 
+/// How the generated actions fared over a whole run.
+///
+/// Exists because "no findings in 200 cases" is not on its own evidence of anything.
+/// If the generator keeps producing calls the contract refuses, the cases prove very
+/// little — and the run looks identical to a healthy one. This is the number that
+/// tells the two apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionStats {
+    /// Actions the contract accepted.
+    pub accepted: u64,
+    /// Actions the contract refused, where the target declared the refusal expected
+    /// through [`Target::expects_rejection`](crate::Target::expects_rejection).
+    ///
+    /// Negative tests live here: a target that deliberately calls a privileged
+    /// entrypoint without credentials *wants* that call refused.
+    pub expected_rejections: u64,
+    /// Actions the contract refused without the target expecting it.
+    ///
+    /// The signature of a model that does not match the contract. Every one of these
+    /// is a case that exercised less than its author believed.
+    pub unexpected_rejections: u64,
+}
+
+impl ActionStats {
+    /// Total actions executed across the run.
+    pub fn total(&self) -> u64 {
+        self.accepted + self.expected_rejections + self.unexpected_rejections
+    }
+
+    /// Unexpected rejections as a fraction of all actions, in `0.0..=1.0`.
+    ///
+    /// Zero when no actions ran, so an empty run is not reported as perfect: use
+    /// [`ActionStats::total`] to distinguish "nothing was rejected" from "nothing ran".
+    pub fn rejection_ratio(&self) -> f64 {
+        let total = self.total();
+        if total == 0 {
+            0.0
+        } else {
+            self.unexpected_rejections as f64 / total as f64
+        }
+    }
+
+    /// True when no actions ran at all.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+impl fmt::Display for ActionStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} actions: {} accepted, {} rejected unexpectedly, {} rejected as expected by the target",
+            self.total(),
+            self.accepted,
+            self.unexpected_rejections,
+            self.expected_rejections
+        )
+    }
+}
+
 /// The result of a fuzz run.
 #[derive(Clone, Debug)]
 pub enum FuzzOutcome {
@@ -370,6 +466,16 @@ pub enum FuzzOutcome {
         cases: u32,
         /// Seed the run used, so a flake can be reproduced.
         seed: u64,
+        /// What happened to the generated actions.
+        stats: ActionStats,
+        /// A diagnostic about the run itself — not a finding about the contract.
+        ///
+        /// Currently raised when too many generated actions were rejected by the
+        /// contract without the target expecting it, which usually means the model and
+        /// the contract disagree. A run that carries a warning still passed, so it must
+        /// not be treated as a failure; it means the green result is weaker than it
+        /// looks.
+        warning: Option<String>,
     },
     /// A failing case was found and minimized.
     Failed(Box<FailureReport>),
@@ -409,11 +515,42 @@ impl FuzzOutcome {
         }
     }
 
+    /// How the generated actions fared, when the run completed.
+    ///
+    /// `None` for a failed or aborted run: neither has a meaningful ratio, because a
+    /// failed run stopped at the first violation and an aborted one never got going.
+    pub fn stats(&self) -> Option<ActionStats> {
+        match self {
+            FuzzOutcome::Passed { stats, .. } => Some(*stats),
+            _ => None,
+        }
+    }
+
+    /// The run's diagnostic, if it raised one. See [`FuzzOutcome::Passed`].
+    pub fn warning(&self) -> Option<&str> {
+        match self {
+            FuzzOutcome::Passed { warning, .. } => warning.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Panics with the rendered report unless the run passed.
     ///
-    /// Intended as the last line of a `#[test]`.
+    /// Intended as the last line of a `#[test]`. A warning does **not** panic: it says
+    /// the green result is weaker than it looks, not that the contract is broken.
+    ///
+    /// Note that `cargo test` captures the output of passing tests, so a warning here
+    /// is only visible under `--nocapture` unless the test asserts on it. Read it from
+    /// [`FuzzOutcome::warning`] when the warning itself is what you are testing.
     pub fn assert_ok(&self) {
         match self {
+            FuzzOutcome::Passed {
+                stats,
+                warning: Some(warning),
+                ..
+            } => {
+                eprintln!("soroban-fuzzer: warning: {warning}\n  {stats}");
+            }
             FuzzOutcome::Passed { .. } => {}
             FuzzOutcome::Failed(report) => panic!("\n{}", report.pretty()),
             FuzzOutcome::Aborted { reason } => {
@@ -426,8 +563,17 @@ impl FuzzOutcome {
 impl fmt::Display for FuzzOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FuzzOutcome::Passed { cases, seed } => {
-                write!(f, "passed ({cases} cases, seed {seed})")
+            FuzzOutcome::Passed {
+                cases,
+                seed,
+                stats,
+                warning,
+            } => {
+                write!(f, "passed ({cases} cases, seed {seed}; {stats}")?;
+                if warning.is_some() {
+                    write!(f, "; with a warning")?;
+                }
+                f.write_str(")")
             }
             FuzzOutcome::Failed(_) => f.write_str("failed"),
             FuzzOutcome::Aborted { reason } => write!(f, "aborted: {reason}"),

@@ -517,6 +517,16 @@ impl Target for TokenTarget {
         }
     }
 
+    /// Only the token has entries in this fixture, so scoping to it is exact.
+    ///
+    /// Worth stating explicitly: the invariants below read the token's balances, so a
+    /// snapshot that missed any of them would silently weaken every check. The test
+    /// `scoping_a_snapshot_matches_filtering_a_full_one` asserts the equivalence rather
+    /// than leaving it to inspection.
+    fn tracked_contracts(&self, world: &World) -> Vec<Address> {
+        vec![world.contract.clone()]
+    }
+
     fn invariants(&self) -> Vec<Box<dyn Invariant<Self>>> {
         vec![
             // Conservation of value, read out of the contract's own balance entries
@@ -1104,6 +1114,17 @@ impl Target for VaultTarget {
         }
     }
 
+    /// **Both** contracts, because the invariants read both.
+    ///
+    /// The vault's bookkeeping lives under the vault's address and the balances it is
+    /// meant to be backed by live under the token's, so naming only the vault would
+    /// make the solvency invariant compare against nothing. This is precisely the mistake
+    /// the `tracked_contracts` documentation warns about, in a fixture that would fail
+    /// loudly rather than quietly if it were made.
+    fn tracked_contracts(&self, world: &VaultWorld) -> Vec<Address> {
+        vec![world.vault.clone(), world.token.clone()]
+    }
+
     fn invariants(&self) -> Vec<Box<dyn Invariant<Self>>> {
         vec![
             FnInvariant::new(
@@ -1227,6 +1248,85 @@ fn cross_contract_vault_holds_its_invariants() {
     );
 }
 
+/// Scoping a capture is exactly filtering a full one — asserted, not assumed.
+///
+/// The runner scopes every snapshot to the target's `tracked_contracts`, which is a
+/// performance change that must not be a semantic one. This pins the equivalence
+/// directly: the scoped snapshot has to equal a full snapshot filtered to the same
+/// contracts, entry for entry, and it has to actually drop the entries it excludes.
+/// Note the three cases — one contract, two, and none — because "empty means
+/// unscoped" is the part most likely to be got wrong in the other direction.
+#[test]
+fn scoping_a_snapshot_matches_filtering_a_full_one() {
+    let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.ledger().set_sequence_number(START_LEDGER);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = deploy_token(&env, &admin);
+    let vault = env.register(Vault, (token.clone(),));
+
+    env.mock_all_auths();
+    TokenClient::new(&env, &token).mint(&user, &1_000i128);
+    VaultClient::new(&env, &vault).deposit(&user, &400i128);
+    env.set_auths(&[]);
+
+    let full = StorageSnapshot::capture(&env);
+    assert!(
+        full.counts_for(&token).total() > 0 && full.counts_for(&vault).total() > 0,
+        "the fixture needs entries under both contracts for this to mean anything"
+    );
+
+    // One contract: same entries as the full snapshot has for it, and none of the
+    // other contract's.
+    let token_only = StorageSnapshot::capture_scoped(&env, std::slice::from_ref(&token));
+    assert_eq!(token_only, full.scoped(std::slice::from_ref(&token)));
+    assert_eq!(
+        token_only.counts_for(&token),
+        full.counts_for(&token),
+        "scoping must not drop any of the named contract's entries"
+    );
+    assert_eq!(
+        token_only.counts_for(&vault).total(),
+        0,
+        "scoping must exclude the entries that were not named"
+    );
+    assert!(
+        token_only.total_entries() < full.total_entries(),
+        "scoping that drops nothing would not be worth doing"
+    );
+
+    // Both contracts: every entry of theirs, and nothing of anyone else's.
+    let both = StorageSnapshot::capture_scoped(&env, &[token.clone(), vault.clone()]);
+    assert_eq!(both, full.scoped(&[token.clone(), vault.clone()]));
+    assert_eq!(both.counts_for(&token), full.counts_for(&token));
+    assert_eq!(both.counts_for(&vault), full.counts_for(&vault));
+    assert!(
+        both.total_entries() < full.total_entries(),
+        "scoping to the two contracts should still drop the entries owned by other \
+         addresses, which here is what `mock_all_auths` leaves behind"
+    );
+
+    // That third party is worth naming, because it is the reason this test cannot just
+    // assert `both == full`: mocking every authorization registers a **temporary
+    // nonce entry per authorizing address**, owned by that address rather than by any
+    // contract. It is real ledger state, so a full snapshot includes it, and scoping to
+    // the contracts under test correctly excludes it. Asserted rather than assumed, so
+    // a change to that behaviour shows up here.
+    let nonce_entries = full.total_entries().saturating_sub(both.total_entries());
+    assert!(
+        nonce_entries > 0,
+        "the fixture should have third-party entries for this to be meaningful"
+    );
+
+    // No contracts named: the safe direction, meaning "do not scope" rather than
+    // "see nothing".
+    assert_eq!(StorageSnapshot::capture_scoped(&env, &[]), full);
+    assert_eq!(full.scoped(&[]), full);
+}
+
 /// Storage is attributed to the contract that owns it.
 ///
 /// The token stores one `i128` per balance and the vault stores one `i128` per
@@ -1263,4 +1363,249 @@ fn cross_contract_storage_is_attributed_per_contract() {
     // The composition holds at this point: the vault really is holding the tokens.
     assert_eq!(TokenClient::new(&env, &token).balance(&vault), 400);
     assert_eq!(VaultClient::new(&env, &vault).held(), 400);
+}
+
+// ===========================================================================
+// Part 3: a scenario that crosses a ledger boundary
+// ===========================================================================
+
+/// What the run knows across the three stages of the scenario.
+#[derive(Clone, Debug)]
+struct LedgerModel {
+    /// Which stage of the scenario the sequence is in: 0 approve, 1 close, 2 spend.
+    ///
+    /// Drives both `actions` and `next_state`, which is how a generated sequence of
+    /// exactly three actions walks the stages in order — every other target in this
+    /// crate generates each action from the whole state, but a scenario is precisely a
+    /// sequence whose *order* is the point.
+    stage: u8,
+    ledger: u32,
+    /// The holder's allowance to the spender, as `(amount, live_until_ledger)`.
+    allowance: Option<(i128, u32)>,
+    balances: [i128; 2],
+}
+
+/// The allowance the contract would report, applying the contract's own expiry rule.
+fn live_allowance(model: &LedgerModel) -> i128 {
+    match model.allowance {
+        Some((amount, live_until)) if live_until >= model.ledger => amount,
+        _ => 0,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LedgerAct {
+    /// Writes an allowance that expires a few ledgers from now.
+    Approve { live_for: u32 },
+    /// Closes the ledger, and starts the next one far enough ahead that the allowance
+    /// above — and the host's own temporary TTL on it — are both in the past.
+    CloseLedger { ledgers: u32 },
+    /// Spends the allowance the previous stages set up. It must be refused.
+    SpendExpired,
+}
+
+struct MultiLedgerWorld {
+    contract: Address,
+    /// `[holder, spender]`.
+    actors: [Address; 2],
+}
+
+struct MultiLedgerTarget;
+
+impl Target for MultiLedgerTarget {
+    type State = LedgerModel;
+    type Action = LedgerAct;
+    type World = MultiLedgerWorld;
+
+    fn init_state(&self) -> BoxedStrategy<LedgerModel> {
+        constant(LedgerModel {
+            stage: 0,
+            ledger: START_LEDGER,
+            allowance: None,
+            balances: [500, 0],
+        })
+    }
+
+    fn setup(&self, env: &Env, initial: &LedgerModel) -> MultiLedgerWorld {
+        env.ledger().set_sequence_number(START_LEDGER);
+        let actors: [Address; 2] = std::array::from_fn(|_| Address::generate(env));
+        let contract = deploy_token(env, &actors[0]);
+
+        // Fund the holder through the real entrypoint, so the fixture cannot drift
+        // from the token's own bookkeeping.
+        env.mock_all_auths();
+        TokenClient::new(env, &contract).mint(&actors[0], &initial.balances[0]);
+        env.set_auths(&[]);
+
+        MultiLedgerWorld { contract, actors }
+    }
+
+    fn actions(&self, state: &LedgerModel) -> BoxedStrategy<LedgerAct> {
+        match state.stage {
+            0 => (1u32..=3)
+                .prop_map(|live_for| LedgerAct::Approve { live_for })
+                .boxed(),
+            // Deliberately past the host's own sixteen-ledger temporary TTL as well as
+            // past the contract's deadline, so the entry is genuinely reclaimed rather
+            // than merely reported as expired.
+            1 => (17u32..=40)
+                .prop_map(|ledgers| LedgerAct::CloseLedger { ledgers })
+                .boxed(),
+            _ => Just(LedgerAct::SpendExpired).boxed(),
+        }
+    }
+
+    fn next_state(&self, mut state: LedgerModel, action: &LedgerAct) -> LedgerModel {
+        match action {
+            LedgerAct::Approve { live_for } => {
+                state.allowance = Some((50, state.ledger + live_for));
+            }
+            LedgerAct::CloseLedger { ledgers } => {
+                state.ledger += ledgers;
+            }
+            // Must be refused, so nothing moves.
+            LedgerAct::SpendExpired => {}
+        }
+        state.stage += 1;
+        state
+    }
+
+    fn execute(&self, rt: &mut Runtime<'_, MultiLedgerWorld>, action: &LedgerAct) -> StepOutcome {
+        let contract = rt.world().contract.clone();
+        let holder = rt.world().actors[0].clone();
+        let spender = rt.world().actors[1].clone();
+        let client = TokenClient::new(rt.env(), &contract);
+
+        match action {
+            LedgerAct::Approve { live_for } => {
+                let live_until = rt.ledger().sequence() + live_for;
+                rt.authorize(
+                    &holder,
+                    &contract,
+                    "approve",
+                    (holder.clone(), spender.clone(), 50i128, live_until),
+                );
+                rt.call("approve", || {
+                    client.try_approve(&holder, &spender, &50i128, &live_until)
+                })
+                .expect_ok()
+            }
+            LedgerAct::CloseLedger { ledgers } => {
+                rt.ledger().close_ledger(*ledgers);
+                StepOutcome::ok()
+            }
+            LedgerAct::SpendExpired => {
+                // Live when it was written, dead now, and the only thing that changed is
+                // that a ledger closed in between. The allowance is in temporary storage,
+                // so the host has reclaimed the entry outright rather than leaving a
+                // stale value behind.
+                rt.call("transfer_from", || {
+                    client.try_transfer_from(&spender, &holder, &spender, &50i128)
+                })
+                .expect_rejected()
+            }
+        }
+    }
+
+    fn describe(&self, action: &LedgerAct) -> String {
+        match action {
+            LedgerAct::Approve { live_for } => format!("approve(50, live for {live_for} ledgers)"),
+            LedgerAct::CloseLedger { ledgers } => format!("close_ledger({ledgers})"),
+            LedgerAct::SpendExpired => "transfer_from(expired allowance)".to_owned(),
+        }
+    }
+
+    fn expects_rejection(&self, action: &LedgerAct) -> bool {
+        matches!(action, LedgerAct::SpendExpired)
+    }
+
+    fn tracked_contracts(&self, world: &MultiLedgerWorld) -> Vec<Address> {
+        vec![world.contract.clone()]
+    }
+
+    fn invariants(&self) -> Vec<Box<dyn Invariant<Self>>> {
+        vec![
+            // The contract's expiry rule and the model's must agree on both sides of the
+            // boundary. If closing the ledger did not actually move time forward as the
+            // contract sees it, this fails immediately.
+            FnInvariant::new(
+                "allowance-expires-across-the-ledger-boundary",
+                |ctx: &CheckCtx<'_, Self>| {
+                    let actual = TokenClient::new(ctx.env, &ctx.world.contract)
+                        .allowance(&ctx.world.actors[0], &ctx.world.actors[1]);
+                    let expected = live_allowance(ctx.model);
+                    if actual != expected {
+                        return Err(format!(
+                            "at ledger {} the contract reports an allowance of {actual}, \
+                             the model expects {expected}",
+                            ctx.model.ledger
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .boxed(),
+            FnInvariant::new("balances-match-model", |ctx: &CheckCtx<'_, Self>| {
+                let client = TokenClient::new(ctx.env, &ctx.world.contract);
+                for (ix, expected) in ctx.model.balances.iter().enumerate() {
+                    let actual = client.balance(&ctx.world.actors[ix]);
+                    if actual != *expected {
+                        return Err(format!(
+                            "actor {ix}: the contract holds {actual}, the model expects {expected}"
+                        ));
+                    }
+                }
+                Ok(())
+            })
+            .boxed(),
+            StorageGrowthBounded::total(64).boxed(),
+        ]
+    }
+}
+
+/// A temporary allowance is written, a ledger closes past its deadline, and the spend
+/// that was legal before the boundary is refused after it.
+///
+/// The stage-driven sequence makes this a genuine scenario rather than three unrelated
+/// actions: the run cannot reach the third stage without the first two having happened.
+/// The statistics are asserted rather than assumed, because they are what proves the
+/// boundary had an effect — every one of the `cases` sequences reached the spend *and*
+/// had it refused, with no sequence accepted anywhere unexpected. A run in which
+/// closing the ledger did nothing would have succeeded at `transfer_from` instead, and
+/// the `expect_rejected` conversion turns that into a finding.
+#[test]
+fn an_allowance_is_reclaimed_across_a_ledger_boundary() {
+    let cases = 24u32;
+    let outcome = run(
+        MultiLedgerTarget,
+        FuzzConfig::default()
+            .cases(cases)
+            .actions(3, 3)
+            .seed(0x001E_D6E0_F00D),
+    );
+    assert!(
+        !outcome.is_failure(),
+        "the scenario must hold across the ledger boundary:\n{outcome:?}"
+    );
+
+    let stats = outcome.stats().expect("the run should have completed");
+    assert_eq!(
+        stats.total(),
+        u64::from(cases) * 3,
+        "every case should have run all three stages: {stats}"
+    );
+    assert_eq!(
+        stats.expected_rejections,
+        u64::from(cases),
+        "the spend after the boundary must have been refused in every case: {stats}"
+    );
+    assert_eq!(
+        stats.unexpected_rejections, 0,
+        "nothing else in the scenario should have been refused: {stats}"
+    );
+    assert_eq!(
+        outcome.warning(),
+        None,
+        "a scenario this deliberate must not warn"
+    );
 }

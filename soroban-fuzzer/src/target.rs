@@ -93,6 +93,8 @@ use core::fmt::Debug;
 use proptest::prelude::{BoxedStrategy, Just, Strategy};
 use soroban_sdk::Env;
 
+use soroban_sdk::Address;
+
 use crate::invariant::Invariant;
 use crate::runtime::{Runtime, StepOutcome};
 
@@ -176,6 +178,94 @@ pub trait Target: 'static {
     /// Renders an action for failure reports. Defaults to `Debug`.
     fn describe(&self, action: &Self::Action) -> String {
         format!("{action:?}")
+    }
+
+    /// True when this action is *supposed* to be refused by the contract.
+    ///
+    /// The harness cannot tell a deliberate negative test from a model that disagrees
+    /// with the contract: both produce calls the contract rejects. Declaring the
+    /// deliberate ones keeps them out of the run's rejection ratio
+    /// ([`ActionStats`](crate::ActionStats)), so that a warning about rejections means
+    /// what it says.
+    ///
+    /// A target with a negative test — calling a privileged entrypoint with no
+    /// credentials to prove it is protected — should return `true` for that action:
+    ///
+    /// ```
+    /// # use soroban_fuzzer::prelude::*;
+    /// # #[derive(Clone, Debug)] enum Act { Mint, UnauthenticatedMint }
+    /// # struct T;
+    /// # impl Target for T {
+    /// #   type State = (); type Action = Act; type World = ();
+    /// #   fn init_state(&self) -> BoxedStrategy<()> { Just(()).boxed() }
+    /// #   fn setup(&self, _: &Env, _: &()) -> () {}
+    /// #   fn actions(&self, _: &()) -> BoxedStrategy<Act> { Just(Act::Mint).boxed() }
+    /// #   fn next_state(&self, _: (), _: &Act) -> () {}
+    /// #   fn execute(&self, _: &mut Runtime<'_, ()>, _: &Act) -> StepOutcome { StepOutcome::ok() }
+    /// fn expects_rejection(&self, action: &Act) -> bool {
+    ///     matches!(action, Act::UnauthenticatedMint)
+    /// }
+    /// # }
+    /// ```
+    fn expects_rejection(&self, action: &Self::Action) -> bool {
+        let _ = action;
+        false
+    }
+
+    /// A stable label for the action's *kind*, without its generated values.
+    ///
+    /// Used to group a run's rejections so that a warning can name which generated
+    /// call the contract kept refusing — which is what turns "half your actions were
+    /// rejected" into something actionable.
+    ///
+    /// Defaults to the [`Target::describe`] text up to the first `(`, which suits the
+    /// `name(args)` convention the crate's own examples use. Override it if your
+    /// descriptions do not follow that shape, since grouping by a description that
+    /// embeds generated values would put every action in its own group.
+    fn action_kind(&self, action: &Self::Action) -> String {
+        let described = self.describe(action);
+        match described.split_once('(') {
+            Some((kind, _)) if !kind.trim().is_empty() => kind.trim().to_owned(),
+            _ => described,
+        }
+    }
+
+    /// The contracts whose storage this run cares about.
+    ///
+    /// Storage snapshots are taken twice per instrumented call, and their cost is
+    /// linear in the total number of ledger entries in the environment. Listing the
+    /// contracts under test lets the harness capture only their entries, which is
+    /// what keeps a run's cost proportional to the state it actually checks.
+    ///
+    /// Returning an empty vector — the default — means "do not scope", and captures
+    /// the whole ledger. That is the safe default: a target that names nothing gets a
+    /// complete snapshot rather than one that silently sees nothing.
+    ///
+    /// **Name every contract the run touches**, including ones reached only through a
+    /// nested call from the world's own contract. An entry belonging to a contract
+    /// that is not named is invisible to invariants and to the harness's read-only
+    /// guard, so under-naming narrows what the harness can notice.
+    ///
+    /// ```
+    /// # use soroban_fuzzer::prelude::*;
+    /// # use soroban_sdk::Address;
+    /// # struct T;
+    /// # impl Target for T {
+    /// #   type State = (); type Action = (); type World = (Address, Address);
+    /// #   fn init_state(&self) -> BoxedStrategy<()> { Just(()).boxed() }
+    /// #   fn setup(&self, _: &soroban_sdk::Env, _: &()) -> (Address, Address) { todo!() }
+    /// #   fn actions(&self, _: &()) -> BoxedStrategy<()> { Just(()).boxed() }
+    /// #   fn next_state(&self, _: (), _: &()) {}
+    /// #   fn execute(&self, _: &mut Runtime<'_, (Address, Address)>, _: &()) -> StepOutcome { StepOutcome::ok() }
+    /// fn tracked_contracts(&self, world: &(Address, Address)) -> Vec<Address> {
+    ///     // The vault and the token it calls into.
+    ///     vec![world.0.clone(), world.1.clone()]
+    /// }
+    /// # }
+    /// ```
+    fn tracked_contracts(&self, world: &Self::World) -> Vec<Address> {
+        let _ = world;
+        Vec::new()
     }
 
     /// The properties that must hold at every step.

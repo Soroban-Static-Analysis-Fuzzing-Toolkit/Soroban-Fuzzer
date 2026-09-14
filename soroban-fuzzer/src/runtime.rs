@@ -41,6 +41,11 @@ use crate::storage::StorageSnapshot;
 /// Seconds of ledger time added per ledger when advancing the ledger.
 pub const SECONDS_PER_LEDGER: u64 = 5;
 
+/// Renders an address for a finding, using the same form the storage keys do.
+fn display_address(address: &Address) -> String {
+    soroban_sdk::xdr::ScAddress::from(address).to_string()
+}
+
 /// What an action did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StepOutcome {
@@ -111,8 +116,19 @@ impl StepOutcome {
 /// | --- | --- |
 /// | [`CallResult::into_step`] | Calls whose failure is routine ("withdraw more than the balance") |
 /// | [`CallResult::expect_ok`] | Calls that must succeed for the input to be meaningful |
-/// | [`CallResult::expect_rejected`] | Negative tests: authorization that must not be granted |
+/// | [`CallResult::expect_rejected`] | Negative tests: a call that must not go through |
 /// | [`CallResult::expect_contract_error`] | Asserting a specific business error, not a trap |
+///
+/// `expect_rejected` is the *lenient* negative test, and it is worth knowing exactly
+/// how lenient. A failed authorization and a contract that merely traps are not
+/// distinguishable through this type at all — the Soroban test environment flattens
+/// both onto the same host status (see `tests/classification.rs`, which pins the
+/// shape). So `expect_rejected` cannot tell "refused because the caller was not
+/// authorized" from "panicked before it ever checked authorization".
+///
+/// [`Runtime::call_requiring_auth`] is the strict form: it asserts positively that
+/// the entrypoint *did* demand the authorization, which is what makes it specific
+/// rather than merely negative.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallResult<T> {
     /// The call returned a value.
@@ -253,6 +269,7 @@ pub struct Runtime<'a, W> {
     limits: InvocationResourceLimits,
     policy: ResourcePolicy,
     step: usize,
+    scoped: &'a [Address],
 }
 
 impl<'a, W> Runtime<'a, W> {
@@ -262,6 +279,7 @@ impl<'a, W> Runtime<'a, W> {
         journal: Rc<RefCell<Journal>>,
         step: usize,
         config: &FuzzConfig,
+        scoped: &'a [Address],
     ) -> Self {
         Self {
             env,
@@ -270,6 +288,7 @@ impl<'a, W> Runtime<'a, W> {
             limits: config.limits.clone(),
             policy: config.resources,
             step,
+            scoped,
         }
     }
 
@@ -293,13 +312,17 @@ impl<'a, W> Runtime<'a, W> {
     }
 
     /// Ledger control for actions that need to move time forward.
-    pub fn ledger(&self) -> LedgerCtl<'_> {
-        LedgerCtl { env: self.env }
+    pub fn ledger(&self) -> LedgerCtl<'a> {
+        LedgerCtl {
+            env: self.env,
+            journal: Rc::clone(&self.journal),
+        }
     }
 
-    /// The current storage contents.
+    /// The current storage contents, scoped to the target's
+    /// [`tracked_contracts`](crate::Target::tracked_contracts).
     pub fn storage(&self) -> StorageSnapshot {
-        StorageSnapshot::capture(self.env)
+        StorageSnapshot::capture_scoped(self.env, self.scoped)
     }
 
     /// Resource usage of the most recent contract invocation, if any has run.
@@ -360,6 +383,98 @@ impl<'a, W> Runtime<'a, W> {
         // `set_auths` also disables any mocking, so this is a true negative test.
         self.env.set_auths(&[]);
         self.measure(label.into(), true, f)
+    }
+
+    /// Invokes the contract with authorization **recorded instead of enforced**, and
+    /// asserts that `address` was required to authorize the call.
+    ///
+    /// This is the strict form of a negative authorization test. The lenient form —
+    /// [`Runtime::call_without_auth`] followed by
+    /// [`CallResult::expect_rejected`] — only establishes that the call did not go
+    /// through, which is satisfied just as well by a contract that panicked on its
+    /// input before it ever looked at authorization. The two are *not*
+    /// distinguishable from the error: measured against `soroban-sdk` 27, a failed
+    /// `require_auth` and an ordinary Rust `panic!` both surface as
+    /// `Err(Ok(Error(Context, InvalidAction)))` from an untyped entrypoint, and as
+    /// `Err(Err(InvokeError::Abort))` from a typed one (pinned in
+    /// `tests/classification.rs`).
+    ///
+    /// So this asserts the property positively instead. It switches the host to
+    /// recording authorization, runs the call, and then reads the authorization tree
+    /// the contract actually demanded: the entrypoint must have succeeded *and* the
+    /// tree must name `address`. That is the mechanism the SDK's own documentation
+    /// recommends for exactly this question — "a test that uses `mock_all_auths`
+    /// without verifying the resulting authorization tree can pass even when a
+    /// contract is missing a `require_auth` check".
+    ///
+    /// # Two things this changes about the run
+    ///
+    /// * **The call succeeds and its state changes are real.** Recording
+    ///   authorization means the credential is never refused, so a correctly
+    ///   protected entrypoint runs to completion. The action's model must account for
+    ///   that, exactly as it would for any positive call, and an entrypoint that
+    ///   panics on its input is reported as a violation rather than as a pass.
+    /// * **Authorization stays recorded for the rest of the action**, so a second
+    ///   contract call in the same action is also unmocked. The runner restores the
+    ///   run's [`AuthPolicy`](crate::AuthPolicy) before the next action.
+    ///
+    /// ```ignore
+    /// // Either of these proves `transfer` is gated on `from`'s authorization; the
+    /// // first also proves the balance check did not get in the way.
+    /// rt.call_requiring_auth("transfer", &from, || client.try_transfer(&from, &to, &amount))
+    /// ```
+    pub fn call_requiring_auth<V, C, E>(
+        &self,
+        label: impl Into<String>,
+        address: &Address,
+        f: impl FnOnce() -> Result<Result<V, C>, Result<E, InvokeError>>,
+    ) -> StepOutcome
+    where
+        C: Debug,
+        E: Debug,
+    {
+        let label = label.into();
+        // Recording mode: every `require_auth` succeeds and is recorded, so the
+        // demanded tree is observable. This is what `Env::mock_all_auths` is.
+        self.env.mock_all_auths();
+
+        let result = self.measure(label.clone(), true, f);
+        match &result {
+            CallResult::Ok(_) => {}
+            CallResult::LimitExceeded(reason) => return StepOutcome::Violation(reason.clone()),
+            other => {
+                return StepOutcome::Violation(format!(
+                    "call `{label}` had to succeed under recorded authorization, to show that \
+                     {who} gates it, but it did not: {} — it is likely failing on its \
+                     input or on an earlier check rather than on authorization",
+                    other.reason().unwrap_or("unknown failure"),
+                    who = display_address(address),
+                ));
+            }
+        }
+
+        // `auths()` reports the tree of the last invocation, which is the call just
+        // made: nothing between here and `measure` starts a contract invocation.
+        let demanded = self.env.auths();
+        if demanded.iter().any(|(who, _)| who == address) {
+            return StepOutcome::Ok;
+        }
+
+        let names = if demanded.is_empty() {
+            "nothing".to_owned()
+        } else {
+            demanded
+                .iter()
+                .map(|(who, _)| display_address(who))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        StepOutcome::Violation(format!(
+            "call `{label}` succeeded under recorded authorization but never demanded \
+             authorization from {who}; it demanded {names}. A privileged entrypoint that \
+             does not require authorization can be called by anyone.",
+            who = display_address(address),
+        ))
     }
 
     /// Like [`Runtime::call`], but never fails the case on a resource-limit breach.
@@ -440,9 +555,9 @@ impl<'a, W> Runtime<'a, W> {
         C: Debug,
         E: Debug,
     {
-        let before = StorageSnapshot::capture(self.env);
+        let before = StorageSnapshot::capture_scoped(self.env, self.scoped);
         let result = f();
-        let after = StorageSnapshot::capture(self.env);
+        let after = StorageSnapshot::capture_scoped(self.env, self.scoped);
 
         let usage = ResourceUsage::capture(self.env).unwrap_or_default();
         let delta = before.diff(&after);
@@ -464,7 +579,7 @@ impl<'a, W> Runtime<'a, W> {
             label: label.clone(),
             outcome,
             usage,
-            writes: delta.writes(),
+            delta,
             entries_after: after.total_entries(),
             breach: breach.clone(),
         });
@@ -493,9 +608,28 @@ impl<'a, W> Runtime<'a, W> {
 ///
 /// TTL behaviour, rent, and time-based logic only show up once the ledger moves, so
 /// a fuzz run that never advances the ledger will never find bugs in them.
-#[derive(Clone, Copy)]
+///
+/// Two operations, and the difference between them is the difference between a
+/// clock moving and a block closing:
+///
+/// * [`LedgerCtl::advance`] moves the ledger *within* the current transaction. Use it
+///   when an entrypoint's behaviour depends on the current time (an allowance's
+///   deadline, a rate that decays).
+/// * [`LedgerCtl::close_ledger`] ends the transaction and starts a new ledger. Use it
+///   for anything the network applies at a ledger boundary: temporary-entry
+///   reclamation, TTL expiry, and time the contract itself only observes across two
+///   separate invocations.
+///
+/// What becomes reachable that was not before is worth stating plainly, because it is
+/// exactly the class of bug a single-ledger run cannot find: an allowance whose
+/// deadline is in the past reads as zero because the host has reclaimed the expired
+/// entry, a temporary entry that has passed its TTL is gone rather than merely stale,
+/// and a contract that caches a ledger number on first use keeps serving it until
+/// something forces it to re-read.
+#[derive(Clone)]
 pub struct LedgerCtl<'a> {
     env: &'a Env,
+    journal: Rc<RefCell<Journal>>,
 }
 
 impl fmt::Debug for LedgerCtl<'_> {
@@ -523,12 +657,52 @@ impl LedgerCtl<'_> {
     ///
     /// Soroban rejects a transaction whose timestamp does not increase, so the two
     /// are always moved together.
+    ///
+    /// This moves the clock *within* the current transaction. For a ledger boundary —
+    /// where the network applies TTL expiry and temporary-entry reclamation — use
+    /// [`LedgerCtl::close_ledger`].
     pub fn advance(&self, ledgers: u32) {
         self.set_sequence_number(self.sequence().saturating_add(ledgers));
         self.set_timestamp(
             self.timestamp()
                 .saturating_add(u64::from(ledgers) * SECONDS_PER_LEDGER),
         );
+    }
+
+    /// Ends the current transaction and starts the next ledger, `ledgers` later.
+    ///
+    /// What happens at a ledger boundary is what makes it different from
+    /// [`LedgerCtl::advance`]: this is where the network closes the ledger and applies
+    /// rent, TTL expiry, and reclamation of expired temporary entries. The contract
+    /// sees the same state, but the entries it depends on may have changed underneath
+    /// it, and anything it cached about the ledger is now stale.
+    ///
+    /// The boundary is recorded in the run's journal, so a report shows where time
+    /// moved rather than leaving a two-action reproducer looking like a single instant.
+    ///
+    /// One honest note about fidelity: the test host applies expiry *lazily*, when an
+    /// entry is next read, rather than sweeping at close. The consequence is that the
+    /// observable difference from [`LedgerCtl::advance`] in this environment is that
+    /// the boundary is explicit and journalled, not that state is swept here — an
+    /// expired temporary entry disappears on the read that follows, and
+    /// `tests/third_party.rs` pins that behaviour against a real contract.
+    pub fn close_ledger(&self, ledgers: u32) {
+        let from_sequence = self.sequence();
+        let to_sequence = from_sequence.saturating_add(ledgers);
+        let timestamp = self
+            .timestamp()
+            .saturating_add(u64::from(ledgers) * SECONDS_PER_LEDGER);
+
+        self.set_sequence_number(to_sequence);
+        self.set_timestamp(timestamp);
+
+        self.journal.borrow_mut().push_call(CallRecord {
+            label: "<ledger>".to_owned(),
+            outcome: format!(
+                "ledger closed: sequence {from_sequence} -> {to_sequence}, timestamp {timestamp}"
+            ),
+            ..CallRecord::default()
+        });
     }
 
     /// Sets the ledger sequence number.

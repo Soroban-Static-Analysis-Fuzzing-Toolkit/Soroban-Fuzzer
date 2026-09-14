@@ -1,0 +1,98 @@
+name: Detector proposal
+description: Propose a vulnerability class for the static analyser to detect.
+title: "Detector: "
+labels: ["detector", "analyzer"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The intended contribution model is **one detector per pull request**, so a
+        proposal should be scoped to a single class. Answering these questions is also
+        most of what the pull request will need, so nothing here is wasted.
+
+        Read [`CONTRIBUTING.md`](../blob/main/CONTRIBUTING.md#adding-a-detector) first:
+        it states the bar a detector has to clear.
+
+  - type: input
+    id: vulnerability-class
+    attributes:
+      label: Vulnerability class
+      description: One line. What goes wrong, in the contract's terms.
+      placeholder: A privileged entrypoint mutates state without requiring authorization.
+    validations:
+      required: true
+
+  - type: textarea
+    id: soroban-specific
+    attributes:
+      label: Why is this Soroban-specific?
+      description: >-
+        Why general Rust tooling does not catch it. This is the question that decides
+        whether the detector belongs in this toolkit at all — if a general linter
+        already catches it, the answer is no.
+      placeholder: |
+        Soroban forbids reentrancy and pushes contracts toward the Abstract Account
+        pattern with a custom `__check_auth`, so "who was supposed to authorize this"
+        varies per contract and is not visible to a Rust linter.
+    validations:
+      required: true
+
+  - type: textarea
+    id: triggers
+    attributes:
+      label: What should trigger it
+      description: Be specific about the shapes. A detector that fires on everything is worse than none.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: not-triggers
+    attributes:
+      label: What must NOT trigger it
+      description: >-
+        The corpus of correct-but-similar code the detector has to stay quiet on.
+        These become the negative fixtures, and they matter more than the positive one.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: vulnerable-snippet
+    attributes:
+      label: A vulnerable snippet
+      description: Small enough to be a fixture.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: correct-snippet
+    attributes:
+      label: The correct version of the same snippet
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: severity
+    attributes:
+      label: Severity and rationale
+      description: >-
+        Why that severity, and not the one above or below it. "It is dangerous" is not
+        a rationale; "it is a robustness bug rather than a fund-loss bug, because the
+        contract traps rather than paying out" is.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      options:
+        - label: A positive fixture produces exactly the expected finding.
+          required: true
+        - label: A negative fixture produces none.
+          required: true
+        - label: Both are tests, not assertions in the description.
+          required: true
