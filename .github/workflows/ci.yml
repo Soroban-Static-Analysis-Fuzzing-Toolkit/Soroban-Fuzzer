@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep logs readable: the harness reports the seed needed to reproduce a finding.
+  RUST_BACKTRACE: "0"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Soroban contracts are deployed with overflow checks enabled, so the
+      # detectors must hold under optimisations too, not just in debug builds.
+      - name: Test with release optimisations
+        run: cargo test --workspace --release
+
+  fuzz:
+    name: Fuzz the example and publish the report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # `examples/token_fuzz.rs` contains a planted missing-`require_auth` bug. This
+      # runs the fuzzer end to end and asserts that the finding survives to a
+      # machine-readable, minimal report — the same path a real project's CI takes.
+      - name: Fuzz the token example
+        env:
+          SOROBAN_FUZZ_CASES: "1024"
+        run: cargo run --example token_fuzz
+
+      - name: Verify the report is a minimal, reproducible reproducer
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+
+          try:
+              report = json.load(open("fuzz-report.json"))
+          except FileNotFoundError:
+              sys.exit("no report: the fuzzer failed to detect the planted missing-require_auth bug")
+
+
+          def check(condition, message):
+              if not condition:
+                  sys.exit(f"unexpected report: {message}")
+
+
+          check(report["kind"] == "unexpected-error", f"kind is {report['kind']!r}")
+          check(
+              "must have been refused" in report["detail"],
+              f"the failure is not the planted missing-auth bug: {report['detail']!r}",
+          )
+          check(report["seed"] is not None, "no seed, so the finding cannot be reproduced")
+          check(
+              len(report["minimal_sequence"]) == 1,
+              f"expected a one-action reproducer, got {len(report['minimal_sequence'])}",
+          )
+
+          calls = [call for step in report["steps"] for call in step["calls"]]
+          check(calls, "the report records no contract calls")
+          check(
+              any(call["usage"]["instructions"] > 0 for call in calls),
+              "no resource usage was metered for any call",
+          )
+
+          print(
+              "report OK:",
+              report["kind"],
+              "| seed",
+              report["seed"],
+              "| reproducer:",
+              report["minimal_sequence"][0],
+          )
+          PY
+
+      - name: Upload the failure report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-fuzzer-report
+          path: fuzz-report.json
+          if-no-files-found: error

@@ -1,0 +1,14 @@
+# Build output
+/target
+**/target
+
+# soroban-sdk writes a snapshot per test environment at drop unless the harness
+# disables it; the fuzzer does, but ordinary soroban tests do not.
+test_snapshots/
+
+# proptest's persisted regressions (only written when explicitly enabled)
+**/proptest-regressions/
+
+# Failure reports produced by `FuzzConfig::report_path`
+fuzz-report.json
+*.fuzz-report.json

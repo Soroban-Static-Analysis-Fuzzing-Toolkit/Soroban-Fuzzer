@@ -1,0 +1,28 @@
+[package]
+name = "soroban-fuzzer"
+description = "Property-based invariant fuzzing harness for Soroban smart contracts, built on soroban-sdk's test environment and proptest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["soroban", "stellar", "fuzzing", "property-based-testing", "security"]
+categories = ["development-tools::testing", "cryptography::cryptocurrencies"]
+
+[dependencies]
+soroban-sdk.workspace = true
+soroban-env-host = { version = "27", features = ["testutils"] }
+proptest.workspace = true
+proptest-state-machine.workspace = true
+arbitrary.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+name = "soroban_fuzzer"
+path = "src/lib.rs"
