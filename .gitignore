@@ -12,3 +12,6 @@ test_snapshots/
 # Failure reports produced by `FuzzConfig::report_path`
 fuzz-report.json
 *.fuzz-report.json
+
+# Benchmark output captured by CI and by `cargo bench | tee bench.txt`
+bench.txt

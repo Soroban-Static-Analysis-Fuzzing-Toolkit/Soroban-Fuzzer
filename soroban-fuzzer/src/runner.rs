@@ -32,6 +32,7 @@ use crate::config::{AuthPolicy, FuzzConfig, ResourcePolicy};
 use crate::invariant::{CheckCtx, Invariant};
 use crate::report::{FailureReport, FuzzOutcome, Journal};
 use crate::runtime::{Runtime, StepOutcome};
+use crate::storage::{StorageSnapshot, StoreKind};
 use crate::target::Target;
 
 /// Fuzzes `target` and returns what happened.
@@ -255,6 +256,16 @@ fn check_invariants<T>(
 ) where
     T: Target,
 {
+    if invariants.is_empty() {
+        return;
+    }
+
+    // An invariant that writes state would make the whole run meaningless: the
+    // contract under test would be mutated by the checker, and a post-action
+    // snapshot could never be trusted. Detect it rather than let it produce a
+    // confusing, non-reproducible finding.
+    let before = StorageSnapshot::capture(env);
+
     for invariant in invariants {
         if action.is_none() && !invariant.check_initial() {
             continue;
@@ -272,6 +283,56 @@ fn check_invariants<T>(
                 .fail("invariant", format!("{}: {detail}", invariant.name()));
             fail_case(journal);
         }
+    }
+
+    let after = StorageSnapshot::capture(env);
+    let delta = before.diff(&after);
+
+    // One change is not the checker's doing. The host reclaims an expired temporary
+    // entry when it reads it, so an invariant that merely *reads* an allowance can
+    // make the entry disappear across this comparison — `tests/third_party.rs` pins
+    // exactly that behaviour against a real contract. A temporary disappearance is
+    // therefore not evidence of a write. Everything else is: any change to instance
+    // or persistent data, and any addition or value update in temporary storage,
+    // means the invariant reached a setter, which would make the run's results depend
+    // on the checker rather than on the contract.
+    let host_reclaimed = delta.instance.is_empty()
+        && delta.persistent.is_empty()
+        && delta.temporary.added == 0
+        && delta.temporary.updated == 0;
+
+    if !delta.is_empty() && !host_reclaimed {
+        // Report what changed, per durability, rather than only how many entries did.
+        // A bare count is unactionable when the offending invariant is one of several,
+        // and it hides the difference between "reached a setter" (values updated) and
+        // "reached a lifecycle operation" (entries added or removed).
+        let mut changes = Vec::new();
+        for kind in StoreKind::ALL {
+            let set = delta.of(kind);
+            if set.is_empty() {
+                continue;
+            }
+            changes.push(format!(
+                "{kind}: {} added, {} removed, {} updated{}",
+                set.added,
+                set.removed,
+                set.updated,
+                if set.changed_keys.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", set.changed_keys.join(", "))
+                }
+            ));
+        }
+        journal.borrow_mut().fail(
+            "invariant",
+            format!(
+                "checking invariants modified contract state ({}); invariants must be \
+                 read-only, so this makes results non-reproducible",
+                changes.join("; ")
+            ),
+        );
+        fail_case(journal);
     }
 }
 

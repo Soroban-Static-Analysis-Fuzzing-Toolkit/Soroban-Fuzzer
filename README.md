@@ -17,7 +17,9 @@ the free first line of defence.
 ```
 .
 ├── Cargo.toml              # workspace
-├── .github/workflows/      # CI: format, lint, test, and fuzz with a report artefact
+├── .github/workflows/      # CI: format, lint, test, MSRV, benches, fuzz report
+├── third-party/            # vendored upstream contract used as a fuzzing fixture +
+│                           #   verify.sh, which re-checks it against its revision
 └── soroban-fuzzer/         # the property fuzzer
     ├── src/
     │   ├── budget.rs       # resource metering against network limits
@@ -29,8 +31,9 @@ the free first line of defence.
     │   ├── storage.rs      # ledger snapshots and diffs
     │   ├── target.rs       # the Target trait
     │   └── prelude.rs      # one-line imports for target files
+    ├── benches/            # throughput and snapshot-scaling measurements
     ├── examples/           # runnable end-to-end example
-    └── tests/              # pass, detect, and classification tests
+    └── tests/              # pass, detect, classification, and third-party tests
 ```
 
 ## Getting started
@@ -38,9 +41,21 @@ the free first line of defence.
 ```bash
 cargo test                        # run the harness's own test suite
 cargo run --example token_fuzz    # see it find a planted bug
+cargo bench -p soroban-fuzzer     # throughput and snapshot-cost numbers
 ```
 
-Requires Rust 1.91 or later, the floor set by `soroban-sdk` 27.
+Requires Rust 1.91 or later, the floor set by `soroban-sdk` 27. CI checks that floor
+rather than only declaring it.
+
+## Is it any good?
+
+The fuzzer is not only tested against fixtures written to be fuzzable. It is run
+against an unmodified third-party contract — `stellar/soroban-examples`' standard
+token, vendored byte-for-byte under [`third-party/`](third-party/) and re-verified
+against its pinned revision by `third-party/verify.sh` — and against a two-contract
+composition built on it. The README for the fuzzer documents what has actually been
+measured and where the approach breaks down; it is worth reading before relying on a
+green run.
 
 Read [`soroban-fuzzer/README.md`](soroban-fuzzer/README.md) for the full guide: what it
 detects and why, how to write a target and invariants, the authorization and resource
@@ -56,4 +71,8 @@ for the pattern.
 
 ## License
 
-Apache-2.0.
+Apache-2.0 — see [`LICENSE`](LICENSE).
+
+The test fixture under [`third-party/`](third-party/) is Apache-2.0 code from
+`stellar/soroban-examples`, redistributed unmodified; its license text and the exact
+revision are recorded there, and [`NOTICE`](NOTICE) carries the attribution.

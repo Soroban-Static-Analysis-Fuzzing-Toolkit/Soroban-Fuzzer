@@ -1803,6 +1803,7 @@ dependencies = [
  "serde_json",
  "soroban-env-host",
  "soroban-sdk",
+ "soroban-token-contract",
 ]
 
 [[package]]
@@ -1890,6 +1891,23 @@ dependencies = [
  "stellar-xdr",
  "syn 2.0.119",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "soroban-token-contract"
+version = "0.0.6"
+dependencies = [
+ "soroban-sdk",
+ "soroban-token-sdk",
+]
+
+[[package]]
+name = "soroban-token-sdk"
+version = "27.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd6dc437f9eb3fa90aed2b8f98fb709b94eded3d517def4a83e696571819b130"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]

@@ -1,0 +1,30 @@
+# Vendored, unmodified third-party contract used as a fuzzing fixture.
+#
+# Source: https://github.com/stellar/soroban-examples/tree/main/token
+# License: Apache-2.0. See PROVENANCE.md for the exact revision and the list of
+# changes made to this manifest (the `src/` tree is byte-identical to upstream).
+#
+# This package is deliberately *not* a workspace member: it is upstream code, and
+# linting or formatting it as if it were ours would be misleading. It is consumed
+# only as a path dev-dependency of `soroban-fuzzer`.
+[package]
+name = "soroban-token-contract"
+description = "Soroban standard token contract (vendored from stellar/soroban-examples for fuzzing)"
+version = "0.0.6"
+edition = "2021"
+rust-version = "1.91.0"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+# Upstream builds this crate as `cdylib` only, which is correct for the Wasm
+# contract artefact but cannot be linked by a native test binary. `rlib` is added
+# so the fuzzer can register and call the contract natively.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { version = "27.0.0" }
+soroban-token-sdk = { version = "27.0.0" }
+
+[dev-dependencies]
+soroban-sdk = { version = "27.0.0", features = ["testutils"] }

@@ -47,6 +47,81 @@ jobs:
       - name: Test with release optimisations
         run: cargo test --workspace --release
 
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The floor declared in `Cargo.toml`, which is `soroban-sdk` 27's own floor.
+      # Declaring an MSRV and never building at it is how it silently drifts upward.
+      - name: Install the declared MSRV
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # `--locked` on purpose: without it cargo may resolve to a dependency that
+      # needs a newer toolchain and fail for a reason that has nothing to do with
+      # this crate's own MSRV.
+      - name: Check at the declared MSRV
+        run: cargo check --workspace --all-targets --locked
+
+  vendored:
+    name: Verify the vendored contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `tests/third_party.rs` claims the contract under `third-party/` is upstream's,
+      # unmodified. That claim is only worth anything if it is checked. This
+      # re-downloads every source file from the pinned revision and fails on any
+      # difference beyond the one documented in PROVENANCE.md.
+      - name: Check the vendored source against its pinned revision
+        run: ./third-party/verify.sh
+
+  bench:
+    name: Benchmark the harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Timings are never asserted — a shared runner is far too noisy for that, and a
+      # threshold would just teach people to ignore the job. What is asserted is that
+      # every measurement still runs and still reports, so a benchmark cannot quietly
+      # stop measuring anything.
+      - name: Run the benchmarks
+        run: |
+          cargo bench -p soroban-fuzzer | tee bench.txt
+          status=0
+          for row in \
+            "env: create" \
+            "storage: capture snapshot" \
+            "metering: read last invocation usage" \
+            "case floor" \
+            "run:"
+          do
+            if ! grep -qF "$row" bench.txt; then
+              echo "::error::benchmark output is missing the '$row' measurement"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Upload the benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-fuzzer-bench
+          path: bench.txt
+          if-no-files-found: error
+
   fuzz:
     name: Fuzz the example and publish the report
     runs-on: ubuntu-latest

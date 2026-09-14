@@ -30,8 +30,8 @@ use std::fmt;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use soroban_sdk::testutils::Ledger as _;
-use soroban_sdk::{Env, InvokeError};
+use soroban_sdk::testutils::{Ledger as _, MockAuth, MockAuthInvoke};
+use soroban_sdk::{Address, Env, IntoVal, InvokeError, Val};
 
 use crate::budget::{InvocationResourceLimits, ResourceUsage};
 use crate::config::{FuzzConfig, ResourcePolicy};
@@ -376,6 +376,48 @@ impl<'a, W> Runtime<'a, W> {
         E: Debug,
     {
         self.measure(label.into(), false, f)
+    }
+
+    /// Installs a credential for exactly one upcoming invocation.
+    ///
+    /// `Address::require_auth()` authorizes the **whole invocation**, so `fn_name`
+    /// and `args` must match what the contract will see, in order. A credential that
+    /// authorizes different arguments is refused, which is what makes this stricter
+    /// (and more useful) than mocking every authorization:
+    ///
+    /// ```ignore
+    /// rt.authorize(&from, &contract, "transfer", (from.clone(), to.clone(), amount));
+    /// rt.call("transfer", || client.try_transfer(&from, &to, &amount)).expect_ok()
+    /// ```
+    ///
+    /// The credential is consumed by that one invocation. The harness clears pending
+    /// credentials before every action, so nothing leaks into the next one.
+    ///
+    /// For a call that authorizes sub-invocations — a contract calling out to another
+    /// contract — use [`Runtime::install_auths`] instead, which can express arbitrary
+    /// trees.
+    pub fn authorize<A>(&self, address: &Address, contract: &Address, fn_name: &str, args: A)
+    where
+        A: IntoVal<Env, soroban_sdk::Vec<Val>>,
+    {
+        let args = args.into_val(self.env);
+        self.env.mock_auths(&[MockAuth {
+            address,
+            invoke: &MockAuthInvoke {
+                contract,
+                fn_name,
+                args,
+                sub_invokes: &[],
+            },
+        }]);
+    }
+
+    /// Installs raw mock authorizations, for credential trees with sub-invocations.
+    ///
+    /// [`Runtime::authorize`] covers the common single-invocation case; reach for this
+    /// when a contract needs to be authorized for the calls it will make onward.
+    pub fn install_auths(&self, auths: &[MockAuth<'_>]) {
+        self.env.mock_auths(auths);
     }
 
     /// Attaches a free-form note to the current step, for debugging reports.

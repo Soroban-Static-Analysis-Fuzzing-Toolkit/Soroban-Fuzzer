@@ -1,0 +1,17 @@
+Soroban Static Analysis & Fuzzing Toolkit
+Copyright 2026 The Soroban Toolkit Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes software developed at Stellar Development Foundation and other
+contributors, redistributed unmodified:
+
+  soroban-examples
+  https://github.com/stellar/soroban-examples
+  Copyright Stellar Development Foundation and contributors
+  Licensed under the Apache License, Version 2.0
+
+  Vendored at revision 1f5aeb53d3db5d0e61e53f59d5e6c5ab58eaf8ce and used only as a
+  test fixture, under third-party/soroban-token-example/. The license text is
+  included with it. What was changed is recorded in that directory's
+  PROVENANCE.md, and third-party/verify.sh re-checks it against upstream.

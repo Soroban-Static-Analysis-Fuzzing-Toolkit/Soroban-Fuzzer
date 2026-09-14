@@ -55,8 +55,8 @@ to deploy the fixture, how to run one action, and the invariants:
 
 ```rust
 use soroban_fuzzer::prelude::*;
-use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
-use soroban_sdk::{Address, Env, IntoVal};
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{Address, Env};
 
 #[derive(Clone, Debug)]
 struct Model { balances: [i128; 3] }
@@ -118,19 +118,15 @@ impl Target for TokenTarget {
                 let to_addr = rt.world().actors[*to].clone();
                 let contract = rt.world().contract.clone();
 
-                // Authorize exactly this invocation for exactly this actor.
-                let env = rt.env();
-                env.mock_auths(&[MockAuth {
-                    address: &from_addr,
-                    invoke: &MockAuthInvoke {
-                        contract: &contract,
-                        fn_name: "transfer",
-                        args: (from_addr.clone(), to_addr.clone(), *amount).into_val(env),
-                        sub_invokes: &[],
-                    },
-                }]);
+                // Authorize exactly this invocation, for exactly this actor.
+                rt.authorize(
+                    &from_addr,
+                    &contract,
+                    "transfer",
+                    (from_addr.clone(), to_addr.clone(), *amount),
+                );
 
-                let client = TokenClient::new(env, &contract);
+                let client = TokenClient::new(rt.env(), &contract);
                 rt.call("transfer", || client.try_transfer(&from_addr, &to_addr, amount))
                     .expect_ok()
             }
@@ -213,7 +209,43 @@ declares a typed error. `tests/classification.rs` pins those shapes down.
 
 **Invariants** are checked after every action and on the initial state. `FnInvariant`
 covers the general case; `SupplyConserved` and `StorageGrowthBounded` cover two
-properties worth having out of the box.
+properties worth having out of the box. They must be read-only: the harness compares
+storage snapshots around every check and fails the case if a check wrote, because a
+checker that mutates the contract makes the run's results depend on the checker rather
+than on the contract.
+
+**Authorization.** `Runtime::authorize(&address, &contract, fn_name, args)` is the
+built-in shorthand for "this address authorizes this entrypoint with exactly these
+arguments". No helper needs to be written per target. `Runtime::install_auths` takes raw
+`MockAuth` values for credential trees, which is what a call that authorizes onward
+sub-invocations needs — see `tests/third_party.rs` for a worked example.
+
+## Preconditions: what keeps shrinking honest
+
+A generated action is only meaningful if the contract could accept it, and
+`Target::preconditions` is where you say so. It matters more than it looks: proptest's
+shrinker consults preconditions too, and without them it will happily reduce a failing
+case to an action the generator could never have produced.
+
+This is not hypothetical. When the real-token fixture below was being written, a
+finding shrank to a `burn(actor1, 1)` **from an actor holding nothing** — which panics,
+and therefore still counts as "fails", so the shrinker kept it. The reported reproducer
+then describes a different bug than the one that was found, and sends you chasing it.
+
+```rust
+fn preconditions(&self, state: &Model, action: &Act) -> bool {
+    match action {
+        Act::Transfer { from, amount, .. } => *amount <= state.balances[*from],
+        Act::Burn { from, amount } => *amount <= state.balances[*from],
+        // ... anything else the model knows must hold of the input.
+        _ => true,
+    }
+}
+```
+
+Anything the model knows must hold of the input belongs here, including the conditions
+the generator already enforces. Preconditions are also checked during generation, so
+they filter as well as protect.
 
 ## Authorization policy
 
@@ -242,6 +274,64 @@ Measured resources approximate a real transaction rather than predicting it exac
 transaction size, the return value, and XDR round-trips are not modelled, and natively
 registered contracts hide VM instantiation cost. Treat a reported breach as a strong
 signal and a reported non-breach as reassurance rather than proof.
+
+## Performance
+
+`cargo bench -p soroban-fuzzer` prints these. They are wall-clock means from repeated
+runs on the machine that built this crate, against the vendored real token contract,
+and they are quoted as **ranges across those runs** — a single figure would be a lie.
+A shared CI runner is slower and noisier still, which is why CI asserts only that every
+measurement is still reported, never its value.
+
+| Operation | Cost |
+| --- | --- |
+| create a test environment | 1.7–1.9 µs |
+| create an environment and deploy the real token | 125–130 µs |
+| `StorageSnapshot::capture`, 1 entry | 1.7–3 µs |
+| `StorageSnapshot::capture`, 16 entries | 18–35 µs |
+| `StorageSnapshot::capture`, 256 entries | 445–560 µs |
+| read the last invocation's resource metering | 3–6 ns |
+| one case of one action, contract work only | 288–294 µs |
+| one case of one action, through the harness | 365–405 µs |
+| one case of eight actions, through the harness | 1.5–2.1 ms |
+
+In round numbers that is **2,500–2,700 cases/s at one action per case** and
+**470–660 cases/s at eight** — so 10,000 one-action cases is a few seconds of fuzzing.
+The harness's own overhead is ~80–110 µs per case: roughly a quarter of a one-action
+case where the contract is cheap, and negligible once sequences are longer.
+
+Two numbers are worth planning around rather than quoting:
+
+* **Snapshot cost is linear in total ledger entries** and is paid twice per
+  instrumented call. A contract holding 256 persistent entries spends ~0.5 ms per
+  snapshot before it does any work of its own, which is comparable to the whole cost
+  of a small case. Large-state contracts need either longer sequences (so the fixed
+  cost amortises) or a target whose invariants tolerate fewer actions.
+* **Deploy dominates cheap cases.** A fresh environment and a fresh deployment per case
+  is what makes a counterexample trustworthy — nothing leaks between cases — and it is
+the main lever on throughput. It is not a knob; it is the property you are paying for.
+
+## Validated against a real contract
+
+`tests/third_party.rs` fuzzes a contract this harness did not design:
+[`stellar/soroban-examples`](https://github.com/stellar/soroban-examples)' token,
+vendored byte-for-byte under `third-party/soroban-token-example/` (see
+`PROVENANCE.md`; `third-party/verify.sh` re-checks it against its pinned revision).
+
+It is a useful counterweight to the crate's own fixtures, which were written to be
+fuzzable. The real token's interface is fixed by the Soroban token standard, and it
+exercises shapes the hand-written fixtures do not: `MuxedAddress` destinations,
+temporary storage with per-entry TTL for allowances alongside persistent balances and
+instance metadata, `soroban_token_sdk` events, and global TTL extension on every
+entrypoint.
+
+It also has **no `total_supply` view**, because the standard token interface does not
+define one. The conservation-of-supply invariant therefore does not read it from the
+contract: it sums the contract's own persistent balance entries out of the harness's
+storage snapshot. That only works because entries are attributed to their owning
+contract — which is exactly what the second half of that file depends on, where a
+small vault composes with the token and the vault's own `i128` bookkeeping sits in the
+same ledger as the token's balances.
 
 ## Reproducing and CI
 
@@ -288,8 +378,46 @@ firing.
 - Ledger control (`rt.ledger().advance(n)`) so TTL and time-based logic is reachable.
 - Storage snapshots read from the host directly, keyed by owning contract, so entries
   from different contracts never collide and reads work outside a contract context.
+- A guard that fails a case whose invariants wrote to storage, reporting which
+  durability and which entries changed.
 
-## Status
+## Limitations
+
+Worth knowing before you trust a green run.
+
+**The fuzzer only explores what your model describes.** Sequences are generated from
+`actions`, filtered by `preconditions`, and checked against `invariants`. A contract
+behaviour the model does not mention is not fuzzed, and a model that disagrees with the
+contract produces confusing findings rather than useful ones. This is inherent to
+generating inputs from a model rather than from the contract's own interface; the
+harness's contribution is that the disagreement surfaces as a failing invariant with a
+minimal reproducer. Nothing validates the model for you, and a green run means "no
+sequence I generated broke a property you stated", not "this contract is correct".
+
+**`into_step()` is lenient about traps.** It treats a host-level trap as a rejection,
+because a correctly-refusing entrypoint with a typed error surfaces as a trap, so a
+stricter default would produce false positives. The consequence is that a genuine panic
+on valid input passes silently under `into_step()`; use `expect_ok()` for calls whose
+input is valid by construction, and `expect_contract_error()` when you want a panic to
+be a finding.
+
+**Invariant checks tolerate one snapshot change.** The read-only guard permits a
+*temporary* entry to disappear during a check, because the host reclaims expired
+temporary entries when reading them — a read-only check can therefore make one vanish.
+Nothing else is tolerated: any change to instance or persistent data, and any addition
+or value update in temporary storage, fails the case.
+
+**One contract per chain, per environment.** Cross-contract composition works and is
+tested, but each case runs in a single `Env` that is thrown away afterwards. There is
+no support for multi-transaction or multi-block scenarios beyond advancing the ledger
+(`rt.ledger().advance`).
+
+## Status and API stability
+
+0.1.x. The `Target` trait, the invariants and the runtime are expected to be stable;
+`report.rs`'s output shape may still change as the consumer side (SARIF, PR review) is
+designed. As semver requires while a crate is 0.x, a breaking change bumps the minor
+version — treat every 0.x minor bump as potentially breaking.
 
 This crate is the property-fuzzer component of a larger toolkit. The static analyser
 (detector engine, resource-budget estimator, SARIF output for PR review) is a separate

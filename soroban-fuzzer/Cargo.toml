@@ -19,6 +19,12 @@ arbitrary.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+# A real, unmodified third-party contract (stellar/soroban-examples' token), used
+# to fuzz code this harness did not design. See third-party/soroban-token-example/
+# PROVENANCE.md, and third-party/verify.sh to re-check it against upstream.
+soroban-token-contract = { path = "../third-party/soroban-token-example" }
+
 [features]
 default = ["std"]
 std = []
@@ -26,3 +32,11 @@ std = []
 [lib]
 name = "soroban_fuzzer"
 path = "src/lib.rs"
+
+# A hand-rolled micro-benchmark rather than a benchmarking framework: the numbers
+# that matter here are throughput and the cost of a storage snapshot, both of which
+# a plain wall-clock loop measures without a dependency. Run with
+# `cargo bench -p soroban-fuzzer`.
+[[bench]]
+name = "harness"
+harness = false

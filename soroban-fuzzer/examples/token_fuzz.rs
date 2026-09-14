@@ -15,15 +15,18 @@
 //! Note that the second run finds the bug even though the harness has authorization
 //! available: the negative test clears credentials for that one call, which is what
 //! `auths()`-mocking unit tests never do.
+//!
+//! The authorized calls install their credentials through [`Runtime::authorize`],
+//! which is the built-in shorthand for "this address authorizes this entrypoint with
+//! these arguments". Note that no helper of that kind is written here: it is part of
+//! the harness, so a target does not have to reimplement it.
 
 use soroban_fuzzer::prelude::*;
-use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+use soroban_sdk::testutils::Address as _;
 
 /// Where a failing case's JSON report is written.
 const REPORT_PATH: &str = "fuzz-report.json";
-// `soroban_sdk::Vec` shadows `std::vec::Vec`, which the harness API uses. Alias it
-// in any file that needs both, or you will get confusing type errors.
-use soroban_sdk::{contract, contractimpl, Address, Env, IntoVal, Symbol, Val, Vec as SdkVec};
+use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
 
 // ---------------------------------------------------------------------------
 // The contract under test
@@ -251,15 +254,16 @@ impl Target for TokenTarget {
             Act::Mint { to, amount } => {
                 let admin = rt.world().admin.clone();
                 let to_addr = rt.world().actors[*to].clone();
-                let env = rt.env();
-                authorize(
-                    env,
+                // `Runtime::authorize` installs a credential naming this entrypoint and
+                // exactly these arguments, which is stricter than mocking every
+                // authorization: a credential for different arguments is refused.
+                rt.authorize(
+                    &admin,
                     &contract,
                     "mint",
-                    &admin,
-                    (admin.clone(), to_addr.clone(), *amount).into_val(env),
+                    (admin.clone(), to_addr.clone(), *amount),
                 );
-                let client = TokenClient::new(env, &contract);
+                let client = TokenClient::new(rt.env(), &contract);
                 rt.call("mint", || client.try_mint(&admin, &to_addr, amount))
                     .expect_ok()
             }
@@ -267,15 +271,13 @@ impl Target for TokenTarget {
             Act::Transfer { from, to, amount } => {
                 let from_addr = rt.world().actors[*from].clone();
                 let to_addr = rt.world().actors[*to].clone();
-                let env = rt.env();
-                authorize(
-                    env,
+                rt.authorize(
+                    &from_addr,
                     &contract,
                     "transfer",
-                    &from_addr,
-                    (from_addr.clone(), to_addr.clone(), *amount).into_val(env),
+                    (from_addr.clone(), to_addr.clone(), *amount),
                 );
-                let client = TokenClient::new(env, &contract);
+                let client = TokenClient::new(rt.env(), &contract);
                 rt.call("transfer", || {
                     client.try_transfer(&from_addr, &to_addr, amount)
                 })
@@ -345,19 +347,6 @@ impl Target for TokenTarget {
             StorageGrowthBounded::total(64).boxed(),
         ]
     }
-}
-
-/// Installs a credential for exactly one upcoming invocation.
-fn authorize(env: &Env, contract: &Address, fn_name: &str, address: &Address, args: SdkVec<Val>) {
-    env.mock_auths(&[MockAuth {
-        address,
-        invoke: &MockAuthInvoke {
-            contract,
-            fn_name,
-            args,
-            sub_invokes: &[],
-        },
-    }]);
 }
 
 fn summarize(label: &str, outcome: &FuzzOutcome) {

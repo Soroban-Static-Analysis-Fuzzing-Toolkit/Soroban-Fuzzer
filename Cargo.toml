@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["soroban-fuzzer"]
+# Vendored upstream code: kept out of the workspace so that `cargo clippy`,
+# `cargo fmt` and the test matrix are not applied to code this project does not
+# own. It is still consumed as a path dev-dependency of `soroban-fuzzer`.
+exclude = ["third-party/soroban-token-example"]
 
 [workspace.package]
 version = "0.1.0"
