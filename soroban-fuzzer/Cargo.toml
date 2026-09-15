@@ -23,7 +23,11 @@ serde_json.workspace = true
 # A real, unmodified third-party contract (stellar/soroban-examples' token), used
 # to fuzz code this harness did not design. See third-party/soroban-token-example/
 # PROVENANCE.md, and third-party/verify.sh to re-check it against upstream.
-soroban-token-contract = { path = "../third-party/soroban-token-example" }
+# The vendored third-party contract. The version is declared even though the path is
+# what resolves it, because a dependency with no version requirement is a dependency
+# whose next update nobody reviews — `cargo deny` rejects wildcards for that reason, and
+# it is right to. The number matches the vendored manifest, which is upstream's.
+soroban-token-contract = { version = "0.0.6", path = "../third-party/soroban-token-example" }
 
 [features]
 default = ["std"]

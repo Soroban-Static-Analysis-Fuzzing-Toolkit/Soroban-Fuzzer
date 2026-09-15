@@ -21,7 +21,36 @@ cargo test --workspace                                   # integration tests + d
 cargo test --workspace --release                         # the detectors must hold optimised too
 cargo bench -p soroban-fuzzer                            # prints numbers, asserts nothing
 cargo run --example token_fuzz                           # finds a planted bug in one call
+cargo run -p soroban-analyzer -- soroban-fuzzer/examples # the analyser finds the same bug
+cargo deny check                                         # licences, advisories and sources
+python3 scripts/check-docs.py                            # the docs match the code
 ```
+
+The estimator needs a compiled contract, which means the target the Soroban SDK supports:
+
+```bash
+rustup target add wasm32v1-none
+cargo build --target wasm32v1-none --release
+cargo run -p soroban-budget -- target/wasm32v1-none/release/<your contract>.wasm
+```
+
+Its own tests build `third-party/soroban-token-example` for that target on first run and
+cache the artefact under `target/`. Without the target they skip and say so, unless
+`SOROBAN_REQUIRE_WASM_FIXTURE=1` is set, which is what CI sets — a skip in CI is a green
+build that measured nothing.
+
+`scripts/check-docs.py` is the one check here that is about the documents rather than
+the code. It re-counts the tests in the landing page's `Tests` row, compares "five rules
+ship today" against `rules/*.json`, fails on a relative link that no longer resolves,
+and fails when a module is missing from its crate's map. If it fails, the fix is to write
+down what was measured — the point of the check is that a measured fact in prose is
+also a fact somebody re-measures.
+
+The analyser is run on this repository by CI, in both directions: the vendored
+third-party contract must come back clean, and the planted bug in
+`soroban-fuzzer/examples/` must be found. If a detector change makes the first of those
+fail, the change over-fires on code this project did not write — which is the only
+precision evidence that is not a fixture written by whoever wrote the detector.
 
 `cargo test --release` is not optional. Soroban contracts deploy with
 `overflow-checks = true`, so an arithmetic finding that exists in debug and disappears
@@ -62,25 +91,55 @@ Every pull request should answer three questions in its description:
 3. **Does behaviour change for existing targets?** "Yes, and here is why" is a fine
    answer; leaving the question unanswered is not.
 
+## Changing the GitHub Action
+
+The Action in [`action.yml`](action.yml) is a composite action: YAML plumbing around
+`scripts/run-analysis.sh`. Keep the decisions in the script, because the script is the part
+that can be tested — `soroban-analyzer/tests/action.rs` runs it with fixtures and asserts
+every exit status, the summary it writes, and what lands in the step outputs.
+
+The YAML around it is exercised by this repository's own CI, which runs the Action against
+the example contract, so a broken input name fails the build. `scripts/check-docs.py` also
+checks that every declared input is used, that every referenced input is declared, and that
+every path the Action runs is committed: an input typo is a workflow value that arrives
+empty, which is the same class of failure as a configuration key that silently does
+nothing.
+
+Do not add a rule to the Action that the analyser does not have. The Action's job is to
+run the analyser where a reviewer can see the result, not to decide anything about
+findings on its own.
+
 ## Adding a detector
 
-The intended model is one detector per pull request. A detector is a vulnerability
-class expressed as a check, plus the evidence that it is neither blind nor noisy.
+The intended model is one detector per pull request, and the format is built so that a
+detector pull request touches no shared file: the registry is generated from the
+directory at build time. A detector is two files in `soroban-analyzer/`.
 
-1. **Write the fixtures first.** Two source files under the detector's fixture
-   directory: one containing the vulnerable pattern, one that is correctly written and
-   superficially similar. The second matters more — a detector that fires on everything
-   is worse than no detector, because it teaches people to ignore findings.
-2. **Implement the check** against the parsed source, reporting file, span, line,
-   column, severity, message and remediation.
-3. **Add the rule metadata** for its id, severity, rationale and references.
-4. **Wire up both directions as tests**: the vulnerable fixture produces exactly the
-   expected finding, and the correct fixture produces none.
+1. **`rules/<id>.json`** — the rule's metadata, including **both fixtures**: source that
+   must trigger it and source that must not. Start here, because the fixtures are the
+   specification and the crate's tests run them on every commit.
+2. **`src/detectors/<name>.rs`** — a `pub struct Detector` implementing `Detector`,
+   naming the rule id from `id()` and using `sink.report(span, message)`.
+
+Then check it locally:
+
+```bash
+cargo test -p soroban-analyzer          # runs every rule's own fixtures
+cargo test -p soroban-analyzer --test rules -- --nocapture
+cargo run -p soroban-analyzer -- --explain <your-rule-id>
+```
 
 **The standard, stated plainly: a detector with no fixture proving it fires, and no
 fixture proving it does not over-fire, is not mergeable.** This is not a style
 preference. A detector is a false-positive generator until it is shown otherwise, and
-the only acceptance test that matters is the two fixtures.
+the fixtures are what show it — `tests/rules.rs` parses and runs every rule's own
+examples on every commit, so a detector that fires on its clean example, or does not
+fire on its triggering one, fails the build. That test also asserts the rule is in the
+README's table and that its `heuristic` flag agrees with its rationale, so the two
+things a reviewer would otherwise have to remember are checked instead.
+
+The second fixture matters more than the first. The first says the check works; the
+second says it is worth running.
 
 A detector proposal issue has a template (see [Templates](#templates)). It asks for the
 Soroban-specific reason general Rust tooling does not catch the class, a vulnerable
@@ -119,11 +178,31 @@ So, to add a bug class:
 4. If the class needs a guard the harness lacks, add the guard in `src/`, and add a test
    that the guard catches the mistake rather than merely not breaking on it.
 
+## Adding to the estimator
+
+`soroban-budget` has two ways to be wrong, and a change needs a test for whichever one it
+touches.
+
+1. **The arithmetic.** Assemble a module in `tests/estimate.rs` with the counts known by
+   construction — `common::nops`, `common::call`, `common::loop_forever` — and assert the
+   number. A change to how a call tree is summed, or to what counts as an operation, is a
+   change to every number the tool has ever printed, and this is where that is visible.
+2. **The reading.** If the change touches how a module is parsed, the test belongs in
+   `tests/compiled_contract.rs`, against the vendored token's compiled Wasm. A parser
+   tested only against modules this project assembled is a parser that agrees with its
+   author; the compiled artefact is the only half of the evidence that is not ours.
+
+Do not add a rule that grades a loop, a `call_indirect` or a recursion: they make an upper
+bound impossible, which is a fact about what the tool can conclude, not a defect in the
+contract. They are reported, and the report says what they prevent.
+
 ## Adding an invariant
 
-`src/invariant.rs` holds `FnInvariant` (the general escape hatch), `SupplyConserved` and
-`StorageGrowthBounded`. A new invariant should be one that many contracts want and few
-would think to write — that is the bar. It needs a rustdoc example that compiles (this
+`src/invariant.rs` holds `FnInvariant` (the general escape hatch), `SupplyConserved`,
+`StorageGrowthBounded` and `NonDecreasing`. A new invariant should be one that many
+contracts want and few would think to write — that is the bar. The built-in three
+follow it: two quantities that must not change, grow without bound or fall, each
+stated in terms of storage the network can take away. It needs a rustdoc example that compiles (this
 crate's doctests are part of its test suite), and a test that it fires on a contract
 that violates it.
 

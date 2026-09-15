@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "soroban-missing-require-auth",
+  "title": "Privileged entrypoint never requires authorization",
+  "severity": "critical",
+  "rationale": "On Soroban, an address a contract receives is only a claim until `require_auth` is called on it: the host has verified nothing, and nothing about the caller is implied by the arguments. An entrypoint that writes storage or moves value without calling `require_auth` on the address it acts for can therefore be invoked by anyone, for any address, with no signature — the classic unprotected `mint`, `transfer`, `set_admin` or `upgrade`. General Rust tooling cannot see this: the code is well-typed and does exactly what it says, and the missing check is the absence of a call, not a suspicious construct.",
+  "remediation": "Call `require_auth()` on the address the operation is for, before the effect: `admin.require_auth()` for an administrative action, `from.require_auth()` for a transfer out of `from`'s balance. If the operation is intentionally permissionless, say so in the code with `// soroban-analyzer: allow(soroban-missing-require-auth)` directly above the entrypoint, so the exception is visible in review rather than assumed.",
+  "references": [
+    "https://developers.stellar.org/docs/build/smart-contracts/example-contracts/authorization",
+    "https://developers.stellar.org/docs/learn/glossary#authorization"
+  ],
+  "heuristic": false,
+  "examples": {
+    "triggers": "use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};\n\n#[contracttype]\npub enum DataKey {\n    Admin,\n    Balance(Address),\n}\n\n#[contract]\npub struct Token;\n\n#[contractimpl]\nimpl Token {\n    // Writes persistent storage and instance storage, and never asks who is calling.\n    // Any account can invoke this for any address it likes.\n    pub fn mint(env: Env, to: Address, amount: i128) {\n        env.storage()\n            .persistent()\n            .set(&DataKey::Balance(to.clone()), &amount);\n        env.storage().instance().set(&DataKey::Admin, &to);\n    }\n}\n",
+    "clean": "use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};\n\n#[contracttype]\npub enum DataKey {\n    Admin,\n    Balance(Address),\n}\n\n#[contract]\npub struct Token;\n\n#[contractimpl]\nimpl Token {\n    // Authorized before the effect, so the caller has to have signed for `admin`.\n    pub fn mint(env: Env, admin: Address, to: Address, amount: i128) {\n        admin.require_auth();\n        env.storage()\n            .persistent()\n            .set(&DataKey::Balance(to.clone()), &amount);\n    }\n\n    // A view function changes nothing, so it needs no authorization even though it\n    // takes an address.\n    pub fn balance(env: Env, who: Address) -> i128 {\n        env.storage()\n            .persistent()\n            .get(&DataKey::Balance(who))\n            .unwrap_or(0)\n    }\n\n    // A constructor has no caller to authorize: it runs at deploy time.\n    pub fn __constructor(env: Env, admin: Address) {\n        env.storage().instance().set(&DataKey::Admin, &admin);\n    }\n}\n\n#[contractimpl]\nimpl Token {\n    // The authorization lives in a helper in this file, which is one level of\n    // delegation the analyser follows.\n    pub fn burn(env: Env, from: Address, amount: i128) {\n        Self::authorize(from.clone());\n        env.storage()\n            .persistent()\n            .set(&DataKey::Balance(from), &amount);\n    }\n\n    fn authorize(from: Address) {\n        from.require_auth();\n    }\n}\n"
+  }
+}

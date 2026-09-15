@@ -1,0 +1,23 @@
+[package]
+name = "soroban-budget"
+description = "Static resource-budget estimator for compiled Soroban contracts: instruction counts, host calls and what makes an upper bound impossible"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["soroban", "stellar", "wasm", "resource-budget", "security"]
+categories = ["development-tools", "cryptography::cryptocurrencies"]
+
+[dependencies]
+# The same parser `soroban-env-host` itself links, so the module this reads is parsed
+# by the code the network parses it with. A hand-rolled reader would be a second
+# opinion about a binary format, which is the one thing a measurement tool must not be.
+wasmparser = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "soroban-budget"
+path = "src/main.rs"

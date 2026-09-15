@@ -9,7 +9,8 @@ mod common;
 
 use common::{
     mock_invocation, HoarderVault, HoarderVaultClient, MissingAuthVault, MissingAuthVaultClient,
-    SavingsVault, SavingsVaultClient, Vault, VaultClient,
+    ReinitVault, ReinitVaultClient, ResettingVault, ResettingVaultClient, SavingsVault,
+    SavingsVaultClient, Vault, VaultClient,
 };
 use soroban_fuzzer::prelude::*;
 use soroban_sdk::testutils::Address as _;
@@ -385,6 +386,264 @@ fn detects_a_resource_budget_blowout() {
     );
 
     assert_eq!(report.minimal_sequence.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// A cumulative quantity that goes backwards
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+enum FeeAct {
+    Accrue {
+        amount: i128,
+    },
+    /// Closes the ledger, starting the next one past the host's sixteen-ledger
+    /// temporary TTL.
+    CloseLedger {
+        ledgers: u32,
+    },
+}
+
+struct FeeWorld {
+    contract: Address,
+    admin: Address,
+}
+
+struct FeeTarget;
+
+impl Target for FeeTarget {
+    type State = u32;
+    type Action = FeeAct;
+    type World = FeeWorld;
+
+    fn init_state(&self) -> BoxedStrategy<u32> {
+        constant(0)
+    }
+
+    fn setup(&self, env: &Env, _initial: &u32) -> FeeWorld {
+        let admin = Address::generate(env);
+        let contract = env.register(ResettingVault, (admin.clone(),));
+        FeeWorld { contract, admin }
+    }
+
+    fn actions(&self, _state: &u32) -> BoxedStrategy<FeeAct> {
+        prop_oneof![
+            3 => (1i128..=100).prop_map(|amount| FeeAct::Accrue { amount }),
+            // Past the host's own temporary TTL, so the entry is genuinely reclaimed
+            // rather than merely left stale.
+            1 => (17u32..=40).prop_map(|ledgers| FeeAct::CloseLedger { ledgers }),
+        ]
+        .boxed()
+    }
+
+    fn next_state(&self, state: u32, _action: &FeeAct) -> u32 {
+        state + 1
+    }
+
+    fn execute(&self, rt: &mut Runtime<'_, FeeWorld>, action: &FeeAct) -> StepOutcome {
+        match action {
+            FeeAct::Accrue { amount } => {
+                let contract = rt.world().contract.clone();
+                let admin = rt.world().admin.clone();
+                rt.authorize(&admin, &contract, "accrue", (admin.clone(), *amount));
+                let client = ResettingVaultClient::new(rt.env(), &contract);
+                rt.call("accrue", || client.try_accrue(&admin, amount))
+                    .expect_ok()
+            }
+            FeeAct::CloseLedger { ledgers } => {
+                rt.ledger().close_ledger(*ledgers);
+                StepOutcome::ok()
+            }
+        }
+    }
+
+    fn describe(&self, action: &FeeAct) -> String {
+        match action {
+            FeeAct::Accrue { amount } => format!("accrue({amount})"),
+            FeeAct::CloseLedger { ledgers } => format!("close_ledger({ledgers})"),
+        }
+    }
+
+    fn invariants(&self) -> Vec<Box<dyn Invariant<Self>>> {
+        vec![
+            // Fees only ever accrue. A ledger boundary that makes the total smaller is
+            // the signature of state that did not survive it.
+            NonDecreasing::new("fees-collected", |env: &Env, world: &FeeWorld| {
+                ResettingVaultClient::new(env, &world.contract).total_fees()
+            })
+            .boxed(),
+        ]
+    }
+}
+
+#[test]
+fn detects_a_cumulative_total_that_goes_backwards() {
+    let outcome = run(
+        FeeTarget,
+        FuzzConfig::default().cases(16).actions(2, 5).seed(61),
+    );
+
+    let report = outcome
+        .report()
+        .expect("a fee total that falls must be detected");
+
+    assert_eq!(report.kind, "invariant", "{}", report.pretty());
+    assert!(
+        report.detail.contains("fees-collected") && report.detail.contains("went backwards"),
+        "the report should name the invariant and what it saw:\n{detail}",
+        detail = report.detail
+    );
+
+    // One accrual and one ledger boundary is the minimum that can lose the entry, so a
+    // longer reproducer means the shrinker left noise in it.
+    assert_eq!(
+        report.minimal_sequence.len(),
+        2,
+        "expected a two-action reproducer:\n{}",
+        report.pretty()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Initialization re-opened across a ledger boundary
+// ---------------------------------------------------------------------------
+
+/// The model of a correctly guarded vault: an admin, once set, is never replaced.
+#[derive(Clone, Debug)]
+struct OwnershipModel {
+    admin: usize,
+}
+
+#[derive(Clone, Debug)]
+enum InitAct {
+    /// Calls `initialize`, authorized by the actor it names.
+    Initialize { as_actor: usize },
+    /// Ends the transaction and starts the next ledger.
+    CloseLedger { ledgers: u32 },
+}
+
+struct InitWorld {
+    contract: Address,
+    actors: [Address; 2],
+}
+
+struct InitTarget;
+
+impl Target for InitTarget {
+    type State = OwnershipModel;
+    type Action = InitAct;
+    type World = InitWorld;
+
+    fn init_state(&self) -> BoxedStrategy<OwnershipModel> {
+        constant(OwnershipModel { admin: 0 })
+    }
+
+    fn setup(&self, env: &Env, _initial: &OwnershipModel) -> InitWorld {
+        let actors = [Address::generate(env), Address::generate(env)];
+        // The vault starts out correctly owned: adopting the admin is the deploy path's
+        // job, and the bug is in what happens to that ownership later.
+        let contract = env.register(ReinitVault, (actors[0].clone(),));
+        InitWorld { contract, actors }
+    }
+
+    fn actions(&self, _state: &OwnershipModel) -> BoxedStrategy<InitAct> {
+        prop_oneof![
+            3 => (0usize..2).prop_map(|as_actor| InitAct::Initialize { as_actor }),
+            1 => (1u32..=8).prop_map(|ledgers| InitAct::CloseLedger { ledgers }),
+        ]
+        .boxed()
+    }
+
+    fn next_state(&self, state: OwnershipModel, _action: &InitAct) -> OwnershipModel {
+        // The specification, not the implementation: an admin is never replaced, however
+        // many ledgers pass. A contract that disagrees fails the invariant below.
+        state
+    }
+
+    fn execute(&self, rt: &mut Runtime<'_, InitWorld>, action: &InitAct) -> StepOutcome {
+        match action {
+            InitAct::Initialize { as_actor } => {
+                let contract = rt.world().contract.clone();
+                let actor = rt.world().actors[*as_actor].clone();
+                rt.authorize(&actor, &contract, "initialize", (actor.clone(),));
+                let client = ReinitVaultClient::new(rt.env(), &contract);
+                // Lenient, because the same-ledger refusal is the contract behaving
+                // correctly: what is wrong is *succeeding* in a later ledger.
+                rt.call("initialize", || client.try_initialize(&actor))
+                    .into_step()
+            }
+            InitAct::CloseLedger { ledgers } => {
+                rt.ledger().close_ledger(*ledgers);
+                StepOutcome::ok()
+            }
+        }
+    }
+
+    fn describe(&self, action: &InitAct) -> String {
+        match action {
+            InitAct::Initialize { as_actor } => format!("initialize(as actor{as_actor})"),
+            InitAct::CloseLedger { ledgers } => format!("close_ledger({ledgers})"),
+        }
+    }
+
+    fn expects_rejection(&self, action: &InitAct) -> bool {
+        // Re-initializing is supposed to be refused; the negative case is declared so it
+        // stays out of the run's rejection ratio. Under a hostile ledger boundary it
+        // succeeds, and that is what the invariant catches.
+        matches!(action, InitAct::Initialize { .. })
+    }
+
+    fn invariants(&self) -> Vec<Box<dyn Invariant<Self>>> {
+        vec![
+            FnInvariant::new("admin-never-changes", |ctx: &CheckCtx<'_, Self>| {
+                let client = ReinitVaultClient::new(ctx.env, &ctx.world.contract);
+                let expected = ctx.world.actors[ctx.model.admin].clone();
+                let actual = client.get_admin();
+                if actual != expected {
+                    return Err(format!(
+                        "the stored admin was replaced: the model holds actor{}, the \
+                         contract serves {actual:?}",
+                        ctx.model.admin
+                    ));
+                }
+                Ok(())
+            })
+            .boxed(),
+        ]
+    }
+}
+
+#[test]
+fn detects_re_initialization_across_a_ledger_boundary() {
+    let outcome = run(
+        InitTarget,
+        FuzzConfig::default().cases(32).actions(2, 6).seed(71),
+    );
+
+    let report = outcome
+        .report()
+        .expect("an initialization guard that a ledger boundary defeats must be detected");
+
+    assert_eq!(report.kind, "invariant", "{}", report.pretty());
+    assert!(
+        report.detail.contains("admin-never-changes"),
+        "the report should name the ownership invariant:\n{detail}",
+        detail = report.detail
+    );
+
+    // A ledger boundary and one re-initialization: nothing else can replace an admin.
+    assert_eq!(
+        report.minimal_sequence.len(),
+        2,
+        "expected a two-action reproducer:\n{}",
+        report.pretty()
+    );
+    let reproducer = report.minimal_sequence.join(" -> ");
+    assert!(
+        reproducer.contains("close_ledger") && reproducer.contains("initialize"),
+        "the reproducer should be a ledger boundary followed by a re-initialization: \
+         {reproducer}"
+    );
 }
 
 // ---------------------------------------------------------------------------

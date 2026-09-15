@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "soroban-read-budget",
+  "title": "Storage reads exceed the per-invocation ceiling",
+  "severity": "high",
+  "rationale": "A Soroban invocation may read at most 200 ledger entries, and the charge is per entry rather than per byte, so a routine that walks a nested structure reads hundreds of entries without reading much data. Unlike an unbounded loop, this is a count the contract's author can compute from the source: a read inside two loops of 20 costs 400, and the call cannot land no matter what the caller does, because there is no input that makes it cheaper. The check is arithmetic over the source rather than a measurement, which is exactly why it belongs in a static analyser: the number is in the code, and a fuzzer only finds it by running the one input that gets there. The estimate is a heuristic in both directions and is marked as one: it over-counts a `while i < 42` whose counter does not start at zero, and it does not count reads performed by a function the entrypoint calls.",
+  "remediation": "Reduce the number of entries touched per call: restructure the nested walk into a single pass, cache what is read in one entry rather than spreading it over many, or split the work into batches the caller drives with a cursor. If the entries are being read to compute an aggregate, consider maintaining the aggregate incrementally at write time instead.",
+  "references": [
+    "https://developers.stellar.org/docs/learn/encyclopedia/network-configuration/fees-metering"
+  ],
+  "heuristic": true,
+  "examples": {
+    "triggers": "use soroban_sdk::{contract, contractimpl, Env};\n\n#[contract]\npub struct Batch;\n\n#[contractimpl]\nimpl Batch {\n    // 15 x 20 = 300 ledger entries read, over the 200 an invocation is allowed.\n    // Every loop bound is a literal, so this call fails for every caller.\n    pub fn sweep(env: Env) {\n        for i in 0..15 {\n            for j in 0..20 {\n                env.storage().persistent().get(&(i, j));\n            }\n        }\n    }\n}\n",
+    "clean": "use soroban_sdk::{contract, contractimpl, Env};\n\n#[contract]\npub struct Batch;\n\n#[contractimpl]\nimpl Batch {\n    // 10 x 10 = 100 entries, comfortably inside the ceiling.\n    pub fn sweep(env: Env) {\n        for i in 0..10 {\n            for j in 0..10 {\n                env.storage().persistent().get(&(i, j));\n            }\n        }\n    }\n}\n"
+  }
+}

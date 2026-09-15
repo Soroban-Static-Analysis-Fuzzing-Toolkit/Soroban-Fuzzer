@@ -1,0 +1,106 @@
+name: 'Soroban analyzer'
+description: >
+  Static analysis for Soroban contracts: finds missing require_auth, storage-durability
+  misuse, unbounded storage loops, reads over the 200-entry ceiling and unchecked
+  arithmetic, then uploads a SARIF report to GitHub code scanning so the findings land on
+  the lines of the pull request. A recorded baseline is supported, so an existing tree can
+  be adopted without a red build.
+
+author: 'Soroban Static Analysis & Fuzzing Toolkit'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  path:
+    description: 'File or directory to analyse, relative to the repository root.'
+    required: false
+    default: '.'
+  severity:
+    description: >
+      Severity at or above which a finding fails the run: info, low, medium, high or
+      critical. The default matches the analyser's own, so a first run reports without
+      failing the build.
+    required: false
+    default: 'high'
+  baseline:
+    description: >
+      Baseline file to excuse known findings with, as written by `--write-baseline`. Path
+      relative to the repository root.
+    required: false
+    default: ''
+  fail-on-findings:
+    description: >
+      Whether findings at or above `severity` fail the step. `false` still analyses,
+      uploads and summarises, which is how a team adopts the analyser before it has dealt
+      with what it finds.
+    required: false
+    default: 'true'
+  upload-sarif:
+    description: >
+      Upload the report to GitHub code scanning. Needs `security-events: write`. Reports
+      only annotate the diff when this is on.
+    required: false
+    default: 'true'
+  sarif-file:
+    description: 'Where to write the report.'
+    required: false
+    default: 'soroban-analyzer.sarif'
+
+outputs:
+  findings:
+    description: 'How many findings at or above the gate the run reported.'
+    value: ${{ steps.analyze.outputs.findings }}
+  sarif-file:
+    description: 'The report that was written, for uploading or archiving elsewhere.'
+    value: ${{ steps.analyze.outputs.report }}
+
+runs:
+  using: 'composite'
+  steps:
+    # There are no published binaries yet, so the action builds the analyser from its own
+    # checkout. `rust-cache` keys on the action's manifest path, so the build is only slow
+    # the first time a workflow runs on a runner image.
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ${{ github.action_path }}
+
+    - name: Build the analyser
+      shell: bash
+      run: |
+        cargo build --release --locked \
+          --manifest-path "${{ github.action_path }}/Cargo.toml" \
+          -p soroban-analyzer
+
+    - name: Analyse
+      id: analyze
+      shell: bash
+      env:
+        SOROBAN_ANALYZER: ${{ github.action_path }}/target/release/soroban-analyze
+        ANALYZE_PATH: ${{ inputs.path }}
+        SEVERITY: ${{ inputs.severity }}
+        BASELINE: ${{ inputs.baseline }}
+        FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        OUTPUT_FILE: ${{ inputs.sarif-file }}
+      run: bash "${{ github.action_path }}/scripts/run-analysis.sh"
+
+    # `always()` because the interesting case is a run that failed on findings: the report
+    # is what a reviewer needs in order to see them.
+    - name: Upload to code scanning
+      if: ${{ always() && inputs.upload-sarif == 'true' && hashFiles(inputs.sarif-file) != '' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: soroban-analyzer
+
+    - name: Keep the report as an artefact
+      if: ${{ always() && hashFiles(inputs.sarif-file) != '' }}
+      uses: actions/upload-artifact@v6
+      with:
+        name: soroban-analyzer-sarif
+        path: ${{ inputs.sarif-file }}
+        if-no-files-found: error

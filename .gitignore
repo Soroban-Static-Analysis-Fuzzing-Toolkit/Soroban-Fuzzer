@@ -15,3 +15,12 @@ fuzz-report.json
 
 # Benchmark output captured by CI and by `cargo bench | tee bench.txt`
 bench.txt
+
+# Reports written by the CI jobs, which run the tools with their stdout redirected:
+# the analyser's SARIF, and the coverage job's lcov.
+analysis.sarif
+lcov.info
+
+# What the GitHub Action writes when it is run locally, and the log the script keeps.
+soroban-analyzer.sarif
+analysis.stderr

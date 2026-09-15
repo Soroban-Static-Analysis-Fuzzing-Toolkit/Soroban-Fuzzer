@@ -218,3 +218,103 @@ impl SavingsVault {
         balance(&env, &who)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bug 4: a cumulative quantity kept in storage that does not survive
+// ---------------------------------------------------------------------------
+
+#[contract]
+pub struct ResettingVault;
+
+#[contractimpl]
+impl ResettingVault {
+    pub fn __constructor(env: Env, admin: Address) {
+        env.storage().instance().set(&key(&env, "admin"), &admin);
+        env.storage().temporary().set(&key(&env, "fees"), &0i128);
+    }
+
+    /// Adds to the cumulative fee total.
+    ///
+    /// The total is a number the contract's own accounting rests on, and it is written
+    /// to **temporary** storage: the host reclaims the entry once its TTL passes, and
+    /// after that the total reads as zero. Nothing in the contract fails — it serves a
+    /// smaller number than it served a ledger ago, which is the whole bug.
+    pub fn accrue(env: Env, admin: Address, amount: i128) {
+        admin.require_auth();
+        let fees: i128 = env
+            .storage()
+            .temporary()
+            .get(&key(&env, "fees"))
+            .unwrap_or(0);
+        env.storage()
+            .temporary()
+            .set(&key(&env, "fees"), &(fees + amount));
+    }
+
+    /// Reads the cumulative fee total.
+    pub fn total_fees(env: Env) -> i128 {
+        env.storage()
+            .temporary()
+            .get(&key(&env, "fees"))
+            .unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bug 5: initialization re-opened across a ledger boundary
+// ---------------------------------------------------------------------------
+
+#[contract]
+pub struct ReinitVault;
+
+#[contractimpl]
+impl ReinitVault {
+    /// Deploys the vault with an admin, and records the ledger it happened in.
+    pub fn __constructor(env: Env, admin: Address) {
+        env.storage()
+            .instance()
+            .set(&key(&env, "initialized_at"), &env.ledger().sequence());
+        env.storage().instance().set(&key(&env, "admin"), &admin);
+    }
+
+    /// Initializes the vault, at most once per ledger.
+    ///
+    /// The guard compares the ledger the vault was initialized in against the current
+    /// one instead of asking whether an admin already exists. Crossing a ledger boundary
+    /// therefore re-opens initialization, and whoever calls it next replaces the admin —
+    /// a privilege takeover that needs no credential beyond their own. This is the class
+    /// a single-ledger test cannot see and a `close_ledger` scenario can.
+    pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
+        let ledger = env.ledger().sequence();
+        let initialized_at: u32 = env
+            .storage()
+            .instance()
+            .get(&key(&env, "initialized_at"))
+            .unwrap_or(0);
+        if initialized_at == ledger {
+            panic!("already initialized");
+        }
+        env.storage()
+            .instance()
+            .set(&key(&env, "initialized_at"), &ledger);
+        env.storage().instance().set(&key(&env, "admin"), &admin);
+    }
+
+    /// The currently stored admin.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&key(&env, "admin")).unwrap()
+    }
+
+    /// A privileged action, to show what the stored admin is for.
+    pub fn take_fees(env: Env, to: Address, amount: i128) {
+        let admin: Address = env.storage().instance().get(&key(&env, "admin")).unwrap();
+        admin.require_auth();
+        set_balance(&env, &to, balance(&env, &to) + amount);
+    }
+
+    /// A view, so a target can watch a balance without a credential.
+    pub fn get_balance(env: Env, who: Address) -> i128 {
+        balance(&env, &who)
+    }
+}

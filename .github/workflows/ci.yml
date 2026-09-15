@@ -80,6 +80,395 @@ jobs:
       - name: Check the vendored source against its pinned revision
         run: ./third-party/verify.sh
 
+  action:
+    name: The published Action, on this repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # What `upload-sarif` needs. Kept here even though this job disables the upload, so
+      # that the permission a consumer must grant is written down where they will copy it
+      # from.
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+
+      # The Action this repository publishes, run against this repository's own example —
+      # which has a planted critical finding, so the run is a real one. A composite
+      # action's YAML is executed nowhere else: either it is exercised here or it is
+      # shipped unverified, and `soroban-analyzer/tests/action.rs` can only test the script
+      # inside it, not the plumbing around it.
+      - name: Analyse the example contract
+        id: analyze
+        uses: ./
+        with:
+          path: soroban-fuzzer/examples
+          severity: high
+          fail-on-findings: 'false'
+          upload-sarif: 'false'
+
+      - name: The outputs are what a workflow consumes
+        env:
+          FINDINGS: ${{ steps.analyze.outputs.findings }}
+          REPORT: ${{ steps.analyze.outputs.sarif-file }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          def check(condition, message):
+              if not condition:
+                  sys.exit(f"unexpected action result: {message}")
+
+          findings = os.environ["FINDINGS"]
+          check(findings.isdigit(), f"`findings` output is {findings!r}, not a count")
+          check(
+              int(findings) >= 1,
+              "the example has a planted critical finding and the default gate is high, "
+              "so the run must have reported at least one",
+          )
+
+          report = os.environ["REPORT"]
+          check(report.endswith(".sarif"), f"`sarif-file` output is {report!r}")
+          document = json.load(open(report))
+          check(document["version"] == "2.1.0", "the report is not SARIF 2.1.0")
+          results = document["runs"][0]["results"]
+          check(results, "the report carries no results")
+
+          # The finding the example plants, at the level a code-scanning view acts on.
+          planted = [
+              result
+              for result in results
+              if result["ruleId"] == "soroban-missing-require-auth"
+          ]
+          check(planted, "the planted missing-require_auth is not in the report")
+          check(
+              all(result["level"] == "error" for result in planted),
+              "a critical finding must reach the code scanning view as an error",
+          )
+          for result in results:
+              uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+              check(
+                  not uri.startswith("./") and not uri.startswith("/"),
+                  f"{uri!r} is not a repository-relative path, so a scanner cannot resolve it",
+              )
+
+          print(f"action OK: findings={findings}, report={report}")
+          PY
+
+      - name: Upload the report the Action produced
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: soroban-action-sarif
+          path: soroban-analyzer.sarif
+          if-no-files-found: error
+
+  docs:
+    name: Documentation matches the code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # `scripts/check-docs.py` re-measures what the documents claim: that every relative
+      # link resolves, that the landing page's `Tests` row is the count the suites
+      # produce, that "five rules ship today" is five rule files, and that every module a
+      # crate ships is named in that crate's map of itself. A number in prose is updated
+      # by whoever remembers to, and nothing fails when they do not — this is the job that
+      # fails. It needs the toolchain because it counts tests by asking cargo.
+      - name: Check the documentation against the code
+        run: python3 scripts/check-docs.py
+
+  analyze:
+    name: Analyse the contracts in this repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The toolkit is run on itself, and the two assertions are about opposite
+      # failures.
+      #
+      # First: the vendored contract from `stellar/soroban-examples` must come back
+      # clean. That is the only precision evidence for these rules that does not come
+      # from fixtures written in this repository — fixtures are written by whoever wrote
+      # the detector, and code written by someone else is not. A detector that starts
+      # over-firing fails here, on real code, rather than quietly training people to
+      # ignore findings.
+      - name: The unmodified third-party contract must be clean
+        run: |
+          cargo run -q -p soroban-analyzer -- \
+            --severity info third-party/soroban-token-example/src
+
+      # Second: this repository's own example has a planted missing-authorization bug,
+      # and the analyser has to find it, report it at the right level, and exit non-zero
+      # so that a pipeline gating on it would stop. The SARIF is checked structurally
+      # because that document is the product: a finding that never reaches the code
+      # scanning view has not helped anyone.
+      - name: The planted bug must be found, and the exit status must say so
+        run: |
+          set +e
+          cargo run -q -p soroban-analyzer -- --format sarif soroban-fuzzer/examples > analysis.sarif
+          status=$?
+          set -e
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a tree with a planted critical finding must exit 1, got $status"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import sys
+
+          document = json.load(open("analysis.sarif"))
+
+          def check(condition, message):
+              if not condition:
+                  sys.exit(f"unexpected SARIF: {message}")
+
+          check(document["version"] == "2.1.0", f"version is {document['version']!r}")
+          run = document["runs"][0]
+          rules = {rule["id"]: index for index, rule in enumerate(run["tool"]["driver"]["rules"])}
+          results = run["results"]
+          check(results, "no findings at all")
+
+          planted = [
+              result
+              for result in results
+              if result["ruleId"] == "soroban-missing-require-auth"
+          ]
+          check(planted, "the planted missing-require_auth was not reported")
+          check(
+              all(result["level"] == "error" for result in planted),
+              "a critical finding must reach the code scanning view as an error",
+          )
+
+          for result in results:
+              check(result["ruleId"] in rules, f"unknown rule {result['ruleId']!r}")
+              check(
+                  result["ruleIndex"] == rules[result["ruleId"]],
+                  f"{result['ruleId']!r} points at the wrong rule's metadata",
+              )
+              region = result["locations"][0]["physicalLocation"]["region"]
+              check(region["startLine"] >= 1, "a finding with no line cannot be annotated")
+
+          print(f"SARIF OK: {len(results)} findings, {len(rules)} rules described")
+          PY
+
+      - name: Upload the SARIF report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: soroban-analyzer-sarif
+          path: analysis.sarif
+          if-no-files-found: error
+
+  budget:
+    name: Estimate a compiled contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # `wasm32v1-none` is the target the Soroban SDK supports; `wasm32-unknown-unknown`
+      # enables features the environment refuses, and the SDK's build script says so.
+      - name: Install Rust and the Soroban Wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Built from a copy, outside the repository: `third-party/` is byte-identical to its
+      # pinned revision and a build there would leave a lockfile that made it not so (and
+      # a manifest inside this repository but outside its workspace is a cargo error).
+      - name: Compile the vendored contract for Wasm
+        run: |
+          cp -r third-party/soroban-token-example "$RUNNER_TEMP/token"
+          cargo build --manifest-path "$RUNNER_TEMP/token/Cargo.toml" \
+            --target wasm32v1-none --release
+          wasm="$RUNNER_TEMP/token/target/wasm32v1-none/release/soroban_token_contract.wasm"
+          test -f "$wasm"
+          echo "SOROBAN_BUDGET_WASM=$wasm" >> "$GITHUB_ENV"
+
+      # `SOROBAN_REQUIRE_WASM_FIXTURE` turns the crate's skip-when-there-is-no-toolchain
+      # path into a failure. Locally a missing target may mean "not installed"; in CI it
+      # means this job measured nothing, and a green build that measured nothing is the
+      # one outcome a measurement job must not have.
+      - name: Estimate it, from the tests
+        env:
+          SOROBAN_REQUIRE_WASM_FIXTURE: "1"
+        run: cargo test -p soroban-budget
+
+      # And the report is checked as a product, the way the analyser's SARIF is: every
+      # entrypoint of the standard token is present with work behind it, at least one is
+      # bounded exactly, and the document says what its numbers are.
+      - name: The report is a document a pipeline can gate on
+        run: |
+          cargo run -q -p soroban-budget -- --format json "$SOROBAN_BUDGET_WASM" > budget.json
+
+          python3 - <<'PY'
+          import json
+          import sys
+
+          document = json.load(open("budget.json"))
+
+          def check(condition, message):
+              if not condition:
+                  sys.exit(f"unexpected budget report: {message}")
+
+          check(document["schema_version"] == 1, f"schema version {document['schema_version']}")
+          check(
+              "not a CPU prediction" in document["what_this_is"],
+              "the document must state what the numbers are, in a field a consumer cannot miss",
+          )
+
+          entries = {entry["name"]: entry for entry in document["entrypoints"]}
+          for name in [
+              "__constructor", "allowance", "approve", "balance", "burn", "burn_from",
+              "decimals", "mint", "set_admin", "symbol", "transfer", "transfer_from",
+          ]:
+              check(name in entries, f"the standard token exports {name}, and it is missing")
+              check(entries[name]["instructions"] > 0, f"{name} has no instructions behind it")
+              check(entries[name]["host_calls_total"] > 0, f"{name} makes no host calls")
+
+          check(
+              document["summary"]["exactly_bounded"] >= 1,
+              "no entrypoint was bounded exactly, so the reader cannot be working",
+          )
+          check(
+              all(
+                  entry["exact"] == (not entry["unbounded"])
+                  for entry in entries.values()
+              ),
+              "`exact` and the reasons it is not must agree",
+          )
+          for entry in entries.values():
+              for reason in entry["unbounded_reasons"]:
+                  check(reason["explanation"], f"{entry['name']} says it is unbounded without saying why")
+
+          print(
+              f"budget OK: {len(entries)} entrypoints, "
+              f"{document['summary']['exactly_bounded']} exactly bounded"
+          )
+          PY
+
+      # The gates are the part a pipeline depends on, so both directions are asserted:
+      # one that must fire on this contract, and one that must not.
+      - name: The gates fire when they should and only then
+        run: |
+          set +e
+          cargo run -q -p soroban-budget -- --fail-unbounded "$SOROBAN_BUDGET_WASM" > /dev/null 2>&1
+          unbounded=$?
+          cargo run -q -p soroban-budget -- --fail-over 2000000 "$SOROBAN_BUDGET_WASM" > /dev/null 2>&1
+          under=$?
+          set -e
+
+          if [ "$unbounded" -ne 1 ]; then
+            echo "::error::--fail-unbounded must exit 1 when an entrypoint cannot be bounded, got $unbounded"
+            exit 1
+          fi
+          if [ "$under" -ne 0 ]; then
+            echo "::error::a gate nothing crosses must exit 0, got $under"
+            exit 1
+          fi
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: soroban-budget-report
+          path: budget.json
+          if-no-files-found: error
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # A floor, not a target. Measured when this job was added: 89.19% regions and
+      # 88.66% lines for the workspace. The floor sits below that so that ordinary
+      # churn does not fail the build, and above where the suite would have to lose a
+      # whole test file to pass. Coverage is reported as an lcov artifact as well, so a
+      # reviewer can see which lines a new detector left untested.
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 85
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: warn
+
+  licences:
+    name: Licences, advisories and sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The toolkit redistributes third-party code twice over — a large Rust dependency
+      # tree, and an upstream contract vendored under `third-party/` — so "what licences
+      # are we shipping" and "is anything here known-vulnerable" are questions for CI.
+      # `deny.toml` holds the policy; every exception in it is written down with a
+      # reason.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  semver:
+    name: Public API compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Is there a published baseline to compare against?
+        id: baseline
+        run: |
+          # `cargo-semver-checks` compares the current API against the last released
+          # version, and neither crate has been released yet. So this job reports that
+          # it has nothing to do rather than being absent: a documented bootstrap state
+          # is one a reader can trust, and an absent job is indistinguishable from one
+          # somebody deleted. The first `cargo publish` flips this job into a real check.
+          status=$(curl -sS -A "soroban-toolkit-ci" -o /dev/null -w '%{http_code}' \
+            https://crates.io/api/v1/crates/soroban-analyzer || echo 000)
+          if [ "$status" = "200" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::soroban-analyzer has no published version (HTTP $status), so there is no baseline API to compare against; this job checks nothing until the first release."
+          fi
+
+      - uses: taiki-e/install-action@cargo-semver-checks
+        if: steps.baseline.outputs.published == 'true'
+
+      - name: Check for breaking changes in the public API
+        if: steps.baseline.outputs.published == 'true'
+        run: cargo semver-checks check-release -p soroban-analyzer -p soroban-fuzzer
+
   bench:
     name: Benchmark the harness
     runs-on: ubuntu-latest

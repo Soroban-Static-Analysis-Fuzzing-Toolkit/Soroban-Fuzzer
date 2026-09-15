@@ -1,0 +1,28 @@
+[package]
+name = "soroban-analyzer"
+description = "Static analyser for Soroban smart contracts: encodes known Soroban vulnerability patterns as detectors over the contract's Rust source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["soroban", "stellar", "static-analysis", "security", "linter"]
+categories = ["development-tools", "cryptography::cryptocurrencies"]
+
+[dependencies]
+# `full` is required to parse a whole source file rather than an expression;
+# `visit` provides the traversal the detectors are written against, so no
+# detector has to hand-roll a recursive descent over the syntax tree.
+syn = { version = "2", features = ["full", "visit"] }
+# Spans come from `proc-macro2`, which `syn` re-exports nothing of: a detector that
+# wants to point at a node needs the type by name. `span-locations` is what makes a
+# span carry a byte range at all, which is the whole basis of reporting a line and
+# column; without it every finding would point at the start of the file.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "soroban-analyze"
+path = "src/main.rs"

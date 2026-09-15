@@ -1,0 +1,77 @@
+# Dependency policy: what this project is willing to ship.
+#
+# The toolkit redistributes third-party code twice over — it depends on a large Rust
+# tree, and it vendors an upstream Soroban contract under `third-party/` — so "which
+# licences are acceptable" and "is anything here known-vulnerable" are questions CI
+# should answer on every pull request rather than questions a reviewer is trusted to
+# remember. `cargo deny check` runs this in CI.
+#
+# The licence allowlist is not aspirational: it was written from the licences actually
+# present in `cargo metadata` for this workspace (244 packages), so it is the policy this
+# tree already satisfies, stated out loud.
+
+[graph]
+# The vendored contract is excluded from the workspace but is a path dev-dependency of
+# `soroban-fuzzer`, so it is part of the graph and its licence is checked like any other.
+all-features = true
+
+[advisories]
+# The RustSec database. `deny` rather than `warn`: a known advisory in the tree of a
+# security tool is not something to be told about gently.
+version = 2
+yanked = "deny"
+ignore = [
+    # `paste` is unmaintained (not vulnerable). It arrives through
+    # `ark-ff` → `ark-bls12-381` → `soroban-env-host`, which is Stellar's own host
+    # implementation: the version of it in this tree is chosen by `soroban-sdk` 27, and
+    # nothing this project can do removes the dependency. Ignored so that the advisory
+    # check stays a signal for advisories this project *can* act on. Delete this entry
+    # when the host's crypto stack moves off `paste`.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+# Confidence threshold for matching licence text when a crate declares none. `0.9` is
+# cargo-deny's default and is high enough that a near-miss is reported rather than
+# guessed at.
+confidence-threshold = 0.9
+allow = [
+    # Exactly the licences this tree uses, taken from `cargo metadata` rather than from
+    # intuition, so the list is a statement of policy this tree already satisfies. An
+    # entry that a dependency bump stops using is reported by the check below rather than
+    # left in the file looking permissive.
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+]
+# A licence that is not listed above is a failure rather than a warning, which is the
+# point: the failure is the notification. An allowance nothing uses is reported too, so
+# the list cannot drift away from what is actually shipped.
+unused-allowed-license = "warn"
+
+[bans]
+# Duplicate versions are a warning, not an error: the transitive tree contains duplicates
+# this project cannot remove, and failing on them would make the check unpassable rather
+# than informative.
+multiple-versions = "warn"
+
+# A wildcard requirement means "any version", which in a security tool means an
+# unreviewed update can arrive at any time. Declared versions only.
+wildcards = "deny"
+
+# No crate is banned outright. A ban is a decision about a specific dependency, and there
+# is no such decision to record yet.
+deny = []
+
+[sources]
+# Everything comes from crates.io, and a dependency that does not is a change worth
+# noticing: a git dependency is unpinned supply-chain risk.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

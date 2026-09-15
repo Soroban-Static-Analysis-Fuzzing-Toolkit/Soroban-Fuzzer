@@ -1700,6 +1700,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 
 [[package]]
+name = "soroban-analyzer"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "soroban-budget"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wasmparser",
+]
+
+[[package]]
 name = "soroban-builtin-sdk-macros"
 version = "27.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

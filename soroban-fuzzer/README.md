@@ -36,9 +36,10 @@ them are a natural fit for invariant fuzzing.
 | **Missing `require_auth`** | `AuthPolicy::Strict` is the default and installs no credentials, so a privileged entrypoint that mutates state for an unauthenticated address is caught. `call_without_auth(...).expect_rejected()` is a one-line negative test. |
 | **Resource-budget blowouts** | Every invocation is metered and compared against the network's real ceilings — CPU instructions, memory, the **200-entry read limit**, write entries, bytes read and written. A call that cannot land on mainnet is reported by name, with the measured value and the excess. |
 | **Unbounded storage growth** | `StorageGrowthBounded` fails a case when a contract's ledger entries pass a ceiling, catching loops that append to storage without converging. |
+| **State that does not survive a ledger boundary** | `NonDecreasing` fails a case when a cumulative total falls, which is what a value kept in storage the network reclaims looks like from outside; `rt.ledger().close_ledger(n)` is what makes it reachable. |
 
 Add **unchecked arithmetic**, which surfaces as a trap that `expect_ok()` turns into a
-finding, and you have the four classes most likely to cost a Soroban team money.
+finding, and you have the five classes most likely to cost a Soroban team money.
 
 ## Quick start
 
@@ -215,8 +216,12 @@ declares a typed error. `tests/classification.rs` pins those shapes down — alo
 measurement that is worth knowing before writing a negative test, below.
 
 **Invariants** are checked after every action and on the initial state. `FnInvariant`
-covers the general case; `SupplyConserved` and `StorageGrowthBounded` cover two
-properties worth having out of the box. They must be read-only: the harness compares
+covers the general case; `SupplyConserved`, `StorageGrowthBounded` and `NonDecreasing`
+cover three properties worth having out of the box. `NonDecreasing` is the one that
+catches data loss rather than arithmetic: a cumulative total only grows, so a step that
+makes it smaller means a stored value read back as its default — an entry that expired,
+or was reclaimed, or was written to the wrong durability. Read its docs before reaching
+for it on a balance, which is supposed to fall. They must be read-only: the harness compares
 storage snapshots around every check and fails the case if a check wrote, because a
 checker that mutates the contract makes the run's results depend on the checker rather
 than on the contract.
@@ -562,15 +567,25 @@ narrows what the harness can notice.
 ## Status and API stability
 
 0.1.x. The `Target` trait, the invariants and the runtime are expected to be stable;
-`report.rs`'s output shape may still change as the consumer side (SARIF, PR review) is
-designed. As semver requires while a crate is 0.x, a breaking change bumps the minor
-version — treat every 0.x minor bump as potentially breaking.
+`report.rs`'s output shape may still change as the consumer side of it is designed. As
+semver requires while a crate is 0.x, a breaking change bumps the minor version — treat
+every 0.x minor bump as potentially breaking.
 
-This crate is the property-fuzzer component of a larger toolkit. The static analyser
-(detector engine, resource-budget estimator, SARIF output for PR review) is a separate
-component and is not in this repository yet. Detector-per-PR contributions are the
-intended development model, so scoped issues and focused pull requests are welcome —
-see [`CONTRIBUTING.md`](../CONTRIBUTING.md), which also states the bar a detector has to
+This crate is the property-fuzzer half of the [toolkit](../README.md). The other half is
+the static analyser, [`soroban-analyzer/`](../soroban-analyzer/): the detector engine and
+the SARIF output a code-scanning view consumes. The two are separate crates with
+separate releases and neither calls the other — the analyser reads source, the fuzzer
+runs contracts, and the top-level README says what each is for.
+
+The third component is [`soroban-budget/`](../soroban-budget/), which estimates a
+compiled contract's resource cost from its Wasm without running it. It answers a question
+neither this crate nor the analyser can — what the deployed artefact costs — and, like
+them, states what it could not conclude. Note the division of labour with the analyser's
+read-budget rule: that rule counts reads in the source and says so, while the estimator
+measures the compiled call tree and reports a lower bound rather than a prediction.
+Detector-per-PR contributions are the intended development model for the analyser, so
+scoped issues and focused pull requests are welcome — see
+[`CONTRIBUTING.md`](../CONTRIBUTING.md), which also states the bar a detector has to
 clear (a fixture proving it fires, and one proving it does not over-fire).
 
 ## License
