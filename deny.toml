@@ -28,6 +28,13 @@ ignore = [
     # check stays a signal for advisories this project *can* act on. Delete this entry
     # when the host's crypto stack moves off `paste`.
     "RUSTSEC-2024-0436",
+    # Timing side channels in `crypto-bigint` < 0.7.6. The 0.5.5 in this tree arrives
+    # through `elliptic-curve` 0.13 → `k256`/`p256` → `soroban-env-host` 27, which
+    # requires `^0.5`, so no patched version can be selected without changing the SDK.
+    # This project only runs the host in tests and handles no secret keys with it.
+    # Delete this entry when the workspace moves to a `soroban-sdk` whose host no
+    # longer depends on `crypto-bigint` 0.5.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]
