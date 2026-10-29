@@ -37,6 +37,10 @@ impl Durability {
     }
 }
 
+/// Attribute macros that insert a `require_auth` call into the function they wrap.
+pub const AUTHORIZING_ATTRIBUTES: [&str; 4] =
+    ["only_owner", "only_admin", "only_role", "only_any_role"];
+
 /// One entrypoint of a `#[contractimpl]` block.
 pub struct ContractFn<'a> {
     /// The Rust function name.
@@ -45,6 +49,8 @@ pub struct ContractFn<'a> {
     pub sig: &'a Signature,
     /// Its body.
     pub block: &'a syn::Block,
+    /// The attributes written on it, such as `#[only_owner]`.
+    pub attrs: &'a [syn::Attribute],
     /// True for `__constructor`, which runs at deploy time and cannot authorize.
     pub is_constructor: bool,
     /// The byte span of the signature, for reporting.
@@ -59,6 +65,18 @@ impl ContractFn<'_> {
     /// Names beginning with an underscore are the SDK's own hooks and internal helpers.
     pub fn is_exempt(&self) -> bool {
         self.is_constructor || self.name.starts_with('_')
+    }
+
+    /// True when an attribute on the entrypoint expands to a `require_auth` call.
+    ///
+    /// These are OpenZeppelin's `stellar-access` macros. Each one inserts the
+    /// authorization at the top of the body, so the check is there even though the
+    /// source does not show it. `#[has_role]` and `#[has_any_role]` are left out on
+    /// purpose: they check role membership but do not authorize the caller.
+    pub fn has_authorizing_attribute(&self) -> bool {
+        AUTHORIZING_ATTRIBUTES
+            .iter()
+            .any(|name| has_attribute(self.attrs, name))
     }
 
     /// The identifiers of this entrypoint's parameters whose type is (or references)
@@ -157,6 +175,7 @@ pub fn contract_fns(file: &SourceFile) -> Vec<ContractFn<'_>> {
                 name,
                 sig: &function.sig,
                 block: &function.block,
+                attrs: &function.attrs,
                 is_constructor,
                 span: function.sig.span(),
             });

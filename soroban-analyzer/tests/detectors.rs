@@ -145,6 +145,55 @@ impl Token {
 }
 
 #[test]
+fn an_attribute_that_inserts_authorization_is_recognised() {
+    for attribute in [
+        "#[only_owner]",
+        "#[only_admin]",
+        "#[only_role(caller, \"minter\")]",
+        "#[only_any_role(caller, [\"minter\", \"burner\"])]",
+    ] {
+        let source = format!(
+            r#"
+#[contractimpl]
+impl Counter {{
+    {attribute}
+    pub fn reset(e: &Env, caller: Address) {{
+        e.storage().instance().set(&Key::Counter, &0);
+    }}
+}}
+"#
+        );
+        assert!(
+            !fires(AUTH, &source),
+            "{attribute} expands to a require_auth call, so the entrypoint is protected"
+        );
+    }
+}
+
+#[test]
+fn an_attribute_that_only_checks_a_role_still_needs_authorization() {
+    // `has_role` checks membership but does not authorize: anyone can pass any
+    // address that holds the role.
+    for attribute in ["#[has_role(caller, \"minter\")]", "#[when_paused]"] {
+        let source = format!(
+            r#"
+#[contractimpl]
+impl Counter {{
+    {attribute}
+    pub fn reset(e: &Env, caller: Address) {{
+        e.storage().instance().set(&Key::Counter, &0);
+    }}
+}}
+"#
+        );
+        assert!(
+            fires(AUTH, &source),
+            "{attribute} does not authorize anyone"
+        );
+    }
+}
+
+#[test]
 fn an_unprotected_value_movement_is_reported() {
     let hits = findings(
         AUTH,

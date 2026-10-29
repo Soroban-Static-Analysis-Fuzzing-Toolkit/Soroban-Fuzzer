@@ -50,7 +50,7 @@ impl DetectorBehaviour for Detector {
                 // authorize; `_`-prefixed names are the SDK's own hooks.
                 continue;
             }
-            if syntax::calls_require_auth(entry.block) {
+            if syntax::calls_require_auth(entry.block) || entry.has_authorizing_attribute() {
                 continue;
             }
             if delegates_to_an_authorizing_helper(&entry, &authorizing) {

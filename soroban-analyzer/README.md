@@ -237,6 +237,11 @@ project-level ones are worth knowing up front:
   authorization lives two calls away, or in another file, is reported as unprotected. That
   is a false positive, and a deliberate one: the alternative is to say nothing about an
   unprotected `mint`.
+- **Authorization added by an attribute is recognised by name.** OpenZeppelin's
+  `#[only_owner]`, `#[only_admin]`, `#[only_role]` and `#[only_any_role]` insert a
+  `require_auth` call, so an entrypoint carrying one is treated as protected. `#[has_role]`
+  checks membership without authorizing anyone, so it is not. Another crate's macro with
+  the same name would be trusted the same way.
 - **An authorization call anywhere in the body counts**, even inside an `if` that can be
   false, and even when it authorizes a different address than the one acted on. Deciding
   which address was authorized against which was touched needs types and data flow.
@@ -308,7 +313,7 @@ output and a diff of two runs is about the code, whatever `--jobs` was set to.
 cargo test -p soroban-analyzer
 ```
 
-159 tests in five layers: 97 unit tests inside the modules, `tests/detectors.rs` (22) for
+161 tests in five layers: 97 unit tests inside the modules, `tests/detectors.rs` (24) for
 the cases each detector was argued about — mostly the ones it must *not* fire on —
 `tests/rules.rs` (10) for the rule fixtures and the registry invariants, `tests/cli.rs` (24)
 for the binary's output formats, exit statuses, baselines and SARIF structure, and
