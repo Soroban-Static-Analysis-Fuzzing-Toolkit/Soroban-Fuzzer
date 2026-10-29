@@ -151,7 +151,7 @@ permissions:
   security-events: write
 steps:
   - uses: actions/checkout@v5
-  - uses: soroban-security/soroban-toolkit@v1
+  - uses: Soroban-Static-Analysis-Fuzzing-Toolkit/Soroban-Fuzzer@v0.1.0
     with:
       path: .
       severity: medium

@@ -13,7 +13,7 @@ license = "Apache-2.0"
 # soroban-sdk 27 requires 1.91, which is therefore this workspace's floor.
 rust-version = "1.91"
 description = "Open-source security toolkit for Soroban smart contracts"
-repository = "https://github.com/soroban-security/soroban-toolkit"
+repository = "https://github.com/Soroban-Static-Analysis-Fuzzing-Toolkit/Soroban-Fuzzer"
 
 [workspace.dependencies]
 soroban-sdk = { version = "27.0.6", features = ["testutils"] }

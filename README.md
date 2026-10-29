@@ -11,7 +11,6 @@ the free first line of defence.
 | --- | --- | --- |
 | **[soroban-analyzer](soroban-analyzer/)** | Static analysis over the contract's Rust source. Five detectors, each with its own versioned rule metadata and fixtures: missing `require_auth`, storage-durability misuse, unbounded storage loops, a read-count estimate against the 200-entry ceiling, and unchecked arithmetic on amounts. Emits text, JSON or SARIF 2.1.0, and exits non-zero at a configurable severity gate. Adopting it on an existing contract is a recorded baseline plus a `.soroban-analyzer.json`, so only new findings gate, and it checks files in parallel without the output depending on how many cores did it. | **Implemented** |
 | **[soroban-fuzzer](soroban-fuzzer/)** | Property-based invariant fuzzing. Generates sequences of contract calls against `soroban-sdk`'s test environment, checks your invariants after every call, and shrinks failures to a minimal reproducer. Detects missing `require_auth`, resource-budget blowouts, unbounded storage growth, unchecked arithmetic, and cumulative state that does not survive a ledger boundary. Supports cross-ledger scenarios, exact single-case replay, storage scoped to the contracts under test, and a strict authorization test that a panic cannot satisfy. | **Implemented** |
-
 | **[soroban-budget](soroban-budget/)** | Static resource-budget estimation over the **compiled Wasm**. For every entrypoint: the instructions in its static call tree, the host functions it reaches, and whether that count is exact or only a lower bound — the latter whenever the code loops, calls indirectly or recurses, which the report names rather than glosses. Optional `--fail-over` and `--fail-unbounded` gates. | **Implemented** |
 
 The three are for different things, and none replaces another. The analyser reads code it
@@ -51,21 +50,21 @@ the network meters at its own weights and no honest conversion exists without it
 │   ├── rules/            # one versioned JSON file per rule, each with both fixtures
 │   └── tests/            # rule fixtures, detector behaviour, and the binary end to end
 ├── soroban-fuzzer/         # the property fuzzer
-    ├── src/
-    │   ├── arbitrary_bridge.rs  # use an existing `Arbitrary` impl as a Strategy
-    │   ├── budget.rs       # resource metering against network limits
-    │   ├── config.rs       # FuzzConfig, auth and resource policies
-    │   ├── invariant.rs    # Invariant trait and built-in invariants
-    │   ├── report.rs       # journal, failure reports, run outcomes
-    │   ├── runner.rs       # generation, shrinking, per-case execution, replay
-    │   ├── runtime.rs      # instrumented call context for actions
-    │   ├── storage.rs      # ledger snapshots and diffs, scoped per contract
-    │   ├── target.rs       # the Target trait
-    │   └── prelude.rs      # one-line imports for target files
-    ├── benches/            # throughput and snapshot-scaling measurements
-    ├── examples/           # runnable end-to-end example
-    └── tests/              # pass, detect, diagnostics, classification, runtime API,
-                            #   third-party
+│   ├── src/
+│   │   ├── arbitrary_bridge.rs  # use an existing `Arbitrary` impl as a Strategy
+│   │   ├── budget.rs       # resource metering against network limits
+│   │   ├── config.rs       # FuzzConfig, auth and resource policies
+│   │   ├── invariant.rs    # Invariant trait and built-in invariants
+│   │   ├── report.rs       # journal, failure reports, run outcomes
+│   │   ├── runner.rs       # generation, shrinking, per-case execution, replay
+│   │   ├── runtime.rs      # instrumented call context for actions
+│   │   ├── storage.rs      # ledger snapshots and diffs, scoped per contract
+│   │   ├── target.rs       # the Target trait
+│   │   └── prelude.rs      # one-line imports for target files
+│   ├── benches/            # throughput and snapshot-scaling measurements
+│   ├── examples/           # runnable end-to-end example
+│   └── tests/              # pass, detect, diagnostics, classification, runtime API,
+│                           #   third-party
 └── soroban-budget/         # the resource-budget estimator over compiled Wasm
     ├── src/
     │   ├── module.rs       # reading the Wasm: imports, exports, per-function body facts
@@ -79,7 +78,8 @@ the network meters at its own weights and no honest conversion exists without it
 ```bash
 cargo test                                # both crates' test suites
 cargo run --example token_fuzz            # see the fuzzer find a planted bug
-cargo run -p soroban-analyzer -- src/     # see the analyser find one staticallycargo bench -p soroban-fuzzer                     # throughput and snapshot-cost numbers
+cargo run -p soroban-analyzer -- src/     # see the analyser find one statically
+cargo bench -p soroban-fuzzer                     # throughput and snapshot-cost numbers
 cargo run -p soroban-budget -- contract.wasm      # what each entrypoint costs, statically
 ```
 
@@ -112,7 +112,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: soroban-security/soroban-toolkit@v1
+      - uses: Soroban-Static-Analysis-Fuzzing-Toolkit/Soroban-Fuzzer@v0.1.0
         with:
           path: .
           severity: high           # the analyser's own default
@@ -169,7 +169,7 @@ Measured facts rather than impressions:
 
 | Measurement | Value |
 | --- | --- |
-| Tests | 224 across the three crates (159 analyser, 44 fuzzer, 21 budget) plus 22 doctests; `scripts/check-docs.py` re-counts them and fails if this row drifts |
+| Tests | 226 across the three crates (161 analyser, 44 fuzzer, 21 budget) plus 22 doctests; `scripts/check-docs.py` re-counts them and fails if this row drifts |
 | Workspace coverage | 89.19% of regions, 88.66% of lines |
 | Analyzer on the vendored real token | **no findings**, exit 0 |
 | Analyzer on the planted-bug example | 5 findings, 1 critical, exit 1 |

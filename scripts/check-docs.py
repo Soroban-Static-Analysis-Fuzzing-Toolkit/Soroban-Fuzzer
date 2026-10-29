@@ -18,7 +18,8 @@ Four checks, each of which caught something real when it was written:
    compared against `cargo test -- --list`, split into tests and doctests the way
    the row states them.
 3. **"Five rules ship today" is five rules.** The count word in the analyser's
-   README is compared against `rules/*.json`.4. **Every module is in the map.** Each `src/*.rs` is named in its crate's "How it is put
+   README is compared against `rules/*.json`.
+4. **Every module is in the map.** Each `src/*.rs` is named in its crate's "How it is put
    together" table, because a module nobody documented is a module a reader has to
    reverse-engineer.
 5. **The Action's inputs are the ones it uses.** `action.yml` declares inputs and refers to

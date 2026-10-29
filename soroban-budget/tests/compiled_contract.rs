@@ -64,7 +64,7 @@ fn the_standard_token_contract_is_estimated() {
         budget.other_exports
     );
     assert!(
-        !budget.entry("memory").is_some(),
+        budget.entry("memory").is_none(),
         "a memory export is not an entrypoint"
     );
 
